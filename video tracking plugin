@@ -97,6 +97,12 @@ if (!in_array('return_token', $columns)) {
     if ($click_id_info && $click_id_info->Null === 'NO') {
         $wpdb->query("ALTER TABLE $coins_table MODIFY COLUMN click_id BIGINT(20) DEFAULT NULL");
     }
+	
+	// Add coins_awarded column to track if coin was given for this click
+if (!in_array('coins_awarded', $columns)) {
+    $wpdb->query("ALTER TABLE $table ADD COLUMN coins_awarded TINYINT(1) DEFAULT 0");
+}
+	
 });
 
 /* =========================================
@@ -611,40 +617,53 @@ function bvt_tracking_stats_page() {
                 </tr>
             </table>
         </div>
-        
         <h2>Recent Clicks</h2>
-        <table class="wp-list-table widefat fixed striped">
-            <thead>
+<table class="wp-list-table widefat fixed striped">
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>User ID</th>
+            <th>Video URL</th>
+            <th>Redirect Time</th>
+            <th>Return Time</th>
+            <th>Watched (min)</th>
+            <th>IP Address</th>
+            <th>Coins Earned</th>
+            <th>Status</th>
+        </tr>
+    </thead>
+    <tbody>
+        <?php if ($recent_clicks) : ?>
+            <?php foreach ($recent_clicks as $click) : 
+                $watched_min = '';
+                $coins_earned = '0';
+                if ($click->return_time && $click->redirect_time) {
+                    $diff = (strtotime($click->return_time) - strtotime($click->redirect_time)) / 60;
+                    $watched_min = round($diff, 1);
+                    $coins_earned = ($click->coins_awarded == 1) ? '1' : '0';
+                }
+            ?>
                 <tr>
-                    <th>ID</th>
-                    <th>User ID</th>
-                    <th>Video URL</th>
-                    <th>Redirect Time</th>
-                    <th>Return Time</th>
-                    <th>IP Address</th>
-                    <th>Status</th>
+                    <td><?php echo $click->id; ?></td>
+                    <td><?php echo $click->user_id ? $click->user_id : 'Guest'; ?></td>
+                    <td><?php echo esc_html($click->video_url); ?></td>
+                    <td><?php echo $click->redirect_time ? date('Y-m-d H:i:s', strtotime($click->redirect_time)) : '-'; ?></td>
+                    <td><?php echo $click->return_time ? date('Y-m-d H:i:s', strtotime($click->return_time)) : '<span style="color:red;">Pending</span>'; ?></td>
+                    <td><?php echo $watched_min ?: '-'; ?></td>
+                    <td><?php echo esc_html($click->ip_address); ?></td>
+                    <td><strong style="color: <?php echo $coins_earned == '1' ? 'green' : 'gray'; ?>;">
+                        <?php echo $coins_earned == '1' ? '✓ 1 Coin' : '0'; ?>
+                    </strong></td>
+                    <td><?php echo $click->return_time ? '<span style="color:green;">Returned</span>' : '<span style="color:orange;">Pending</span>'; ?></td>
                 </tr>
-            </thead>
-            <tbody>
-                <?php if ($recent_clicks) : ?>
-                    <?php foreach ($recent_clicks as $click) : ?>
-                        <tr>
-                            <td><?php echo $click->id; ?></td>
-                            <td><?php echo $click->user_id ? $click->user_id : 'Guest'; ?></td>
-                            <td><?php echo esc_html($click->video_url); ?></td>
-                            <td><?php echo $click->redirect_time ? date('Y-m-d H:i:s', strtotime($click->redirect_time)) : '-'; ?></td>
-                            <td><?php echo $click->return_time ? date('Y-m-d H:i:s', strtotime($click->return_time)) : '<span style="color:red;">Pending</span>'; ?></td>
-                            <td><?php echo esc_html($click->ip_address); ?></td>
-                            <td><?php echo $click->return_time ? '<span style="color:green;">Returned</span>' : '<span style="color:orange;">Not Returned</span>'; ?></td>
-                        </tr>
-                    <?php endforeach; ?>
-                <?php else : ?>
-                    <tr>
-                        <td colspan="7">No tracking data found.</td>
-                    </tr>
-                <?php endif; ?>
-            </tbody>
-        </table>
+            <?php endforeach; ?>
+        <?php else : ?>
+            <tr>
+                <td colspan="9">No tracking data found.</td>
+            </tr>
+        <?php endif; ?>
+    </tbody>
+</table>
     </div>
     <?php
 }
@@ -1093,9 +1112,11 @@ function showLoginPopup() {
     overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
 }
 
-// Send return confirmation when user interacts
-function sendReturnConfirmation() {
-    if (!currentReturnToken || !isUserLoggedIn) return;
+	
+	
+// Main function: Send return when tab becomes visible again
+function checkAndSendReturn() {
+    if (!currentReturnToken || !isUserLoggedIn || document.visibilityState !== 'visible') return;
 
     fetch("<?php echo admin_url('admin-ajax.php'); ?>", {
         method: 'POST',
@@ -1105,30 +1126,36 @@ function sendReturnConfirmation() {
     })
     .then(r => r.json())
     .then(data => {
-        if (data.success && data.data.eligible) {
-            alert('🎉 Success! You watched the video long enough.\nYou can now claim your 1 coin!');
+        if (data.success) {
+            if (data.data.coin_awarded) {
+                alert('🎉 Great! You earned 1 coin for watching the video!');
+            }
+            // Clean up
+            currentReturnToken = null;
+            document.removeEventListener('visibilitychange', checkAndSendReturn);
         }
-        // Remove listeners after return is recorded
-        document.removeEventListener('click', sendReturnConfirmation);
-        document.removeEventListener('scroll', sendReturnConfirmation);
-        document.removeEventListener('mousemove', sendReturnConfirmation);
-        document.removeEventListener('keydown', sendReturnConfirmation);
     })
-    .catch(() => {});
+    .catch(() => {
+        // Optional: retry once
+        setTimeout(checkAndSendReturn, 3000);
+    });
 }
 
-// Activate tracking when user clicks a video
+// Start tracking when user clicks a video
 function startReturnTracking(token) {
     currentReturnToken = token;
 
-    // Trigger on any user activity
-    document.addEventListener('click', sendReturnConfirmation, { once: true });
-    document.addEventListener('scroll', sendReturnConfirmation, { once: true });
-    document.addEventListener('mousemove', sendReturnConfirmation, { once: true });
-    document.addEventListener('keydown', sendReturnConfirmation, { once: true });
+    // Primary: Trigger when tab becomes visible
+    document.addEventListener('visibilitychange', checkAndSendReturn);
 
-    // Fallback: trigger after 15 seconds in case user is inactive
-    setTimeout(sendReturnConfirmation, 15000);
+    // Backup: Trigger after 30 seconds (in case visibilitychange fails)
+    setTimeout(checkAndSendReturn, 30000);
+
+    // Extra backup: Trigger on any interaction
+    const events = ['click', 'scroll', 'mousemove', 'keydown'];
+    events.forEach(event => {
+        document.addEventListener(event, checkAndSendReturn, { once: true });
+    });
 }
 
 document.querySelectorAll('.video-card').forEach(function(card) {
@@ -1157,8 +1184,7 @@ document.querySelectorAll('.video-card').forEach(function(card) {
                 alert(
                     "Video opening in new tab...\n\n" +
                     "Watch for at least 2 minutes.\n" +
-                    "When you return to this page and scroll, click, or type —\n" +
-                    "we will automatically detect it and make you eligible for 1 coin!"
+                    "When you come back to this tab (even without clicking), we'll automatically reward you!"
                 );
 
                 window.open(videoUrl, '_blank');
@@ -1583,9 +1609,12 @@ function bvt_claim_coins() {
 /* =========================================
  * AJAX: Mark return when user becomes active again
  * ========================================= */
+
+/* =========================================
+ * AJAX: Mark return and auto-award coin if eligible
+ * ========================================= */
 add_action('wp_ajax_bvt_mark_return', 'bvt_mark_return');
 add_action('wp_ajax_nopriv_bvt_mark_return', 'bvt_mark_return');
-
 function bvt_mark_return() {
     if (!isset($_POST['token']) || empty($_POST['token'])) {
         wp_send_json_error(['message' => 'Invalid token']);
@@ -1594,9 +1623,10 @@ function bvt_mark_return() {
 
     global $wpdb;
     $table = $wpdb->prefix . 'video_clicks';
+    $coins_table = $wpdb->prefix . 'user_claim_coins';
+
     $token = sanitize_text_field($_POST['token']);
 
-    // Find pending click with this token
     $click = $wpdb->get_row($wpdb->prepare(
         "SELECT * FROM $table WHERE return_token = %s AND return_time IS NULL LIMIT 1",
         $token
@@ -1608,13 +1638,11 @@ function bvt_mark_return() {
     }
 
     $return_time = current_time('mysql');
-
-    // Record return
     $wpdb->update($table, ['return_time' => $return_time], ['id' => $click->id]);
 
     $user_id = get_current_user_id();
 
-    // Only logged-in users can earn coins
+    // Only award coin to logged-in users
     if ($user_id > 0 && $click->redirect_time) {
         $redirect_date = date('Y-m-d', strtotime($click->redirect_time));
         $return_date   = date('Y-m-d', strtotime($return_time));
@@ -1622,15 +1650,27 @@ function bvt_mark_return() {
         if ($redirect_date === $return_date) {
             $watched_minutes = (strtotime($return_time) - strtotime($click->redirect_time)) / 60;
 
-            if ($watched_minutes > 2) {
+            if ($watched_minutes > 1 && $click->coins_awarded == 0) {
+                // Award 1 coin directly
+                $wpdb->insert($coins_table, [
+                    'user_id' => $user_id,
+                    'click_id' => $click->id,
+                    'coins_amount' => 10,
+                    'claimed_at' => current_time('mysql'),
+                    'transaction_type' => 'watch_reward'
+                ]);
+
+                // Mark as awarded
                 $wpdb->update($table, [
+                    'coins_awarded' => 1,
                     'coins_eligible' => 1,
                     'coins_eligible_at' => $return_time
                 ], ['id' => $click->id]);
 
                 wp_send_json_success([
-                    'message' => 'Return confirmed! You watched more than 2 minutes.',
+                    'message' => 'Success! You earned 10 coin for watching the video!',
                     'eligible' => true,
+                    'coin_awarded' => true,
                     'watched_minutes' => round($watched_minutes, 1)
                 ]);
                 return;
@@ -1647,87 +1687,87 @@ function bvt_mark_return() {
 /* =========================================
  * TRACK USER RETURN (Improved Logic)
  * ========================================= */
-add_action('wp', function() {
-    // Only track return if user came from external site (check referrer)
-    $referrer = isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : '';
-    $current_domain = parse_url(home_url(), PHP_URL_HOST);
-    $referrer_domain = $referrer ? parse_url($referrer, PHP_URL_HOST) : '';
+// add_action('wp', function() {
+//     // Only track return if user came from external site (check referrer)
+//     $referrer = isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : '';
+//     $current_domain = parse_url(home_url(), PHP_URL_HOST);
+//     $referrer_domain = $referrer ? parse_url($referrer, PHP_URL_HOST) : '';
     
-    // If referrer is from external domain or user is logged in, check for pending returns
-    if ($referrer_domain && $referrer_domain !== $current_domain) {
-        global $wpdb;
-        $table = $wpdb->prefix.'video_clicks';
-        $user_id = get_current_user_id();
+//     // If referrer is from external domain or user is logged in, check for pending returns
+//     if ($referrer_domain && $referrer_domain !== $current_domain) {
+//         global $wpdb;
+//         $table = $wpdb->prefix.'video_clicks';
+//         $user_id = get_current_user_id();
         
-        // For logged-in users, match by user_id
-        if ($user_id > 0) {
-            $record = $wpdb->get_row($wpdb->prepare(
-                "SELECT * FROM $table WHERE user_id=%d AND return_time IS NULL ORDER BY id DESC LIMIT 1",
-                $user_id
-            ));
-        } else {
-            // For guests, match by IP address and recent redirect (within last hour)
-            $ip = '';
-            if (!empty($_SERVER['HTTP_CLIENT_IP'])) {
-                $ip = sanitize_text_field($_SERVER['HTTP_CLIENT_IP']);
-            } elseif (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-                $ip = sanitize_text_field($_SERVER['HTTP_X_FORWARDED_FOR']);
-            } else {
-                $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : '';
-            }
+//         // For logged-in users, match by user_id
+//         if ($user_id > 0) {
+//             $record = $wpdb->get_row($wpdb->prepare(
+//                 "SELECT * FROM $table WHERE user_id=%d AND return_time IS NULL ORDER BY id DESC LIMIT 1",
+//                 $user_id
+//             ));
+//         } else {
+//             // For guests, match by IP address and recent redirect (within last hour)
+//             $ip = '';
+//             if (!empty($_SERVER['HTTP_CLIENT_IP'])) {
+//                 $ip = sanitize_text_field($_SERVER['HTTP_CLIENT_IP']);
+//             } elseif (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+//                 $ip = sanitize_text_field($_SERVER['HTTP_X_FORWARDED_FOR']);
+//             } else {
+//                 $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : '';
+//             }
             
-            if ($ip) {
-                $record = $wpdb->get_row($wpdb->prepare(
-                    "SELECT * FROM $table 
-                     WHERE user_id IS NULL 
-                     AND ip_address=%s 
-                     AND return_time IS NULL 
-                     AND redirect_time >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
-                     ORDER BY id DESC LIMIT 1",
-                    $ip
-                ));
-            } else {
-                $record = null;
-            }
-        }
+//             if ($ip) {
+//                 $record = $wpdb->get_row($wpdb->prepare(
+//                     "SELECT * FROM $table 
+//                      WHERE user_id IS NULL 
+//                      AND ip_address=%s 
+//                      AND return_time IS NULL 
+//                      AND redirect_time >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+//                      ORDER BY id DESC LIMIT 1",
+//                     $ip
+//                 ));
+//             } else {
+//                 $record = null;
+//             }
+//         }
         
-        if ($record) {
-            $return_time = current_time('mysql');
-            $wpdb->update(
-                $table,
-                ['return_time' => $return_time],
-                ['id' => $record->id],
-                ['%s'],
-                ['%d']
-            );
+//         if ($record) {
+//             $return_time = current_time('mysql');
+//             $wpdb->update(
+//                 $table,
+//                 ['return_time' => $return_time],
+//                 ['id' => $record->id],
+//                 ['%s'],
+//                 ['%d']
+//             );
             
-            // Check if user is eligible for coins (only for logged-in users)
-            if ($user_id > 0 && $record->redirect_time) {
-                $redirect_date = date('Y-m-d', strtotime($record->redirect_time));
-                $return_date = date('Y-m-d', strtotime($return_time));
+//             // Check if user is eligible for coins (only for logged-in users)
+//             if ($user_id > 0 && $record->redirect_time) {
+//                 $redirect_date = date('Y-m-d', strtotime($record->redirect_time));
+//                 $return_date = date('Y-m-d', strtotime($return_time));
                 
-                // Check if same date and time difference > 2 minutes
-                if ($redirect_date === $return_date) {
-                    $time_diff = (strtotime($return_time) - strtotime($record->redirect_time)) / 60; // in minutes
+//                 // Check if same date and time difference > 2 minutes
+//                 if ($redirect_date === $return_date) {
+//                     $time_diff = (strtotime($return_time) - strtotime($record->redirect_time)) / 60; // in minutes
                     
-                    if ($time_diff > 2) {
-                        // Mark as eligible for coins and set eligibility timestamp
-                        $wpdb->update(
-                            $table,
-                            [
-                                'coins_eligible' => 1,
-                                'coins_eligible_at' => current_time('mysql')
-                            ],
-                            ['id' => $record->id],
-                            ['%d', '%s'],
-                            ['%d']
-                        );
-                    }
-                }
-            }
-        }
-    }
-});    
+//                     if ($time_diff > 2) {
+//                         // Mark as eligible for coins and set eligibility timestamp
+//                         $wpdb->update(
+//                             $table,
+//                             [
+//                                 'coins_eligible' => 1,
+//                                 'coins_eligible_at' => current_time('mysql')
+//                             ],
+//                             ['id' => $record->id],
+//                             ['%d', '%s'],
+//                             ['%d']
+//                         );
+//                     }
+//                 }
+//             }
+//         }
+//     }
+// });    
 
 
 
