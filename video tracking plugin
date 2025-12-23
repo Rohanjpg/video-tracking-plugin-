@@ -65,6 +65,13 @@ register_activation_hook(__FILE__, function() {
     dbDelta($sql);
     dbDelta($sql2);
     
+	// Add return_token column if not exists
+$columns = $wpdb->get_col("DESCRIBE {$wpdb->prefix}video_clicks");
+if (!in_array('return_token', $columns)) {
+    $wpdb->query("ALTER TABLE {$wpdb->prefix}video_clicks ADD COLUMN return_token VARCHAR(100) DEFAULT NULL");
+    $wpdb->query("ALTER TABLE {$wpdb->prefix}video_clicks ADD UNIQUE KEY return_token_unique (return_token)");
+}
+	
     // Add new columns to existing table if they don't exist
     $columns = $wpdb->get_col("DESCRIBE $table");
     if (!in_array('coins_eligible', $columns)) {
@@ -1061,67 +1068,109 @@ add_shortcode('video_links', function () {
     $is_logged_in = is_user_logged_in();
     $login_url = wp_login_url(get_permalink());
     ?>
-    <script>
-    const isUserLoggedIn = <?php echo $is_logged_in ? 'true' : 'false'; ?>;
-    const loginUrl = '<?php echo esc_js($login_url); ?>';
-    
-    // Function to show login popup
-    function showLoginPopup() {
-        // Create popup overlay
-        const overlay = document.createElement('div');
-        overlay.id = 'bvt-login-popup-overlay';
-        overlay.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 999999; display: flex; align-items: center; justify-content: center;';
-        
-        // Create popup box
-        const popup = document.createElement('div');
-        popup.style.cssText = 'background: white; padding: 30px; border-radius: 10px; max-width: 400px; text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.3);';
-        popup.innerHTML = `
-            <h2 style="margin-top: 0; color: #333;">Please Login</h2>
-            <p style="color: #666; margin-bottom: 20px;">You need to be logged in to watch videos.</p>
-            <div style="display: flex; gap: 10px; justify-content: center;">
-                <a href="${loginUrl}" class="button button-primary" style="padding: 10px 20px; text-decoration: none; display: inline-block;">Login</a>
-                <button onclick="document.getElementById('bvt-login-popup-overlay').remove();" class="button" style="padding: 10px 20px; cursor: pointer;">Cancel</button>
-            </div>
-        `;
-        
-        overlay.appendChild(popup);
-        document.body.appendChild(overlay);
-        
-        // Close on overlay click (outside popup)
-        overlay.addEventListener('click', function(e) {
-            if (e.target === overlay) {
-                overlay.remove();
-            }
-        });
-    }
-    
-    document.querySelectorAll('.video-card').forEach(function(card){
-        card.addEventListener('click', function(){
-            // Check if user is logged in
-            if (!isUserLoggedIn) {
-                showLoginPopup();
-                return;
-            }
-            
-            const videoId = card.dataset.id;
-            const videoUrl = card.dataset.url;
 
-            // Send AJAX to store redirect
-            fetch("<?php echo admin_url('admin-ajax.php'); ?>?action=bvt_track_redirect", {
-                method: 'POST',
-                credentials: 'same-origin',
-                headers: {'Content-Type':'application/x-www-form-urlencoded'},
-                body: 'video_id=' + videoId
-            }).then(response => response.json()).then(data => {
-                // Redirect user to video (even if tracking fails)
-                window.location.href = videoUrl;
-            }).catch(error => {
-                // Still redirect even if AJAX fails
-                console.error('Tracking error:', error);
-                window.location.href = videoUrl;
-            });
+<script>
+const isUserLoggedIn = <?php echo $is_logged_in ? 'true' : 'false'; ?>;
+const loginUrl = '<?php echo esc_js($login_url); ?>';
+let currentReturnToken = null;
+
+function showLoginPopup() {
+    const overlay = document.createElement('div');
+    overlay.id = 'bvt-login-popup-overlay';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:999999;display:flex;align-items:center;justify-content:center;';
+    const popup = document.createElement('div');
+    popup.style.cssText = 'background:white;padding:30px;border-radius:10px;max-width:400px;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,0.3);';
+    popup.innerHTML = `
+        <h2 style="margin-top:0;color:#333;">Login Required</h2>
+        <p style="color:#666;margin-bottom:20px;">You must be logged in to earn coins.</p>
+        <div style="display:flex;gap:10px;justify-content:center;">
+            <a href="${loginUrl}" class="button button-primary" style="padding:10px 20px;text-decoration:none;">Login</a>
+            <button onclick="document.getElementById('bvt-login-popup-overlay').remove();" class="button">Cancel</button>
+        </div>
+    `;
+    overlay.appendChild(popup);
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+}
+
+// Send return confirmation when user interacts
+function sendReturnConfirmation() {
+    if (!currentReturnToken || !isUserLoggedIn) return;
+
+    fetch("<?php echo admin_url('admin-ajax.php'); ?>", {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'action=bvt_mark_return&token=' + encodeURIComponent(currentReturnToken)
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success && data.data.eligible) {
+            alert('🎉 Success! You watched the video long enough.\nYou can now claim your 1 coin!');
+        }
+        // Remove listeners after return is recorded
+        document.removeEventListener('click', sendReturnConfirmation);
+        document.removeEventListener('scroll', sendReturnConfirmation);
+        document.removeEventListener('mousemove', sendReturnConfirmation);
+        document.removeEventListener('keydown', sendReturnConfirmation);
+    })
+    .catch(() => {});
+}
+
+// Activate tracking when user clicks a video
+function startReturnTracking(token) {
+    currentReturnToken = token;
+
+    // Trigger on any user activity
+    document.addEventListener('click', sendReturnConfirmation, { once: true });
+    document.addEventListener('scroll', sendReturnConfirmation, { once: true });
+    document.addEventListener('mousemove', sendReturnConfirmation, { once: true });
+    document.addEventListener('keydown', sendReturnConfirmation, { once: true });
+
+    // Fallback: trigger after 15 seconds in case user is inactive
+    setTimeout(sendReturnConfirmation, 15000);
+}
+
+document.querySelectorAll('.video-card').forEach(function(card) {
+    card.addEventListener('click', function(e) {
+        e.preventDefault();
+
+        if (!isUserLoggedIn) {
+            showLoginPopup();
+            return;
+        }
+
+        const videoId = card.dataset.id;
+        const videoUrl = card.dataset.url;
+
+        fetch("<?php echo admin_url('admin-ajax.php'); ?>?action=bvt_track_redirect", {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: 'video_id=' + encodeURIComponent(videoId)
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success && data.data.token) {
+                startReturnTracking(data.data.token);
+
+                alert(
+                    "Video opening in new tab...\n\n" +
+                    "Watch for at least 2 minutes.\n" +
+                    "When you return to this page and scroll, click, or type —\n" +
+                    "we will automatically detect it and make you eligible for 1 coin!"
+                );
+
+                window.open(videoUrl, '_blank');
+            } else {
+                window.open(videoUrl, '_blank');
+            }
+        })
+        .catch(() => {
+            window.open(videoUrl, '_blank');
         });
     });
+});
     
     // Handle Claim Coins button
     const claimBtn = document.getElementById('bvt-claim-coins-btn');
@@ -1393,56 +1442,62 @@ function bvt_upload_video() {
 /* =========================================
  * AJAX HANDLER FOR REDIRECT TRACKING
  * ========================================= */
+/* =========================================
+ * AJAX HANDLER FOR REDIRECT TRACKING
+ * ========================================= */
 add_action('wp_ajax_bvt_track_redirect', 'bvt_track_redirect');
 add_action('wp_ajax_nopriv_bvt_track_redirect', 'bvt_track_redirect');
-
 function bvt_track_redirect() {
-    // Verify nonce for security
     if (!isset($_POST['video_id'])) {
         wp_send_json_error(['message' => 'Missing video ID']);
         return;
     }
-    
+
     global $wpdb;
     $video_id = intval($_POST['video_id']);
-    
     if ($video_id <= 0) {
         wp_send_json_error(['message' => 'Invalid video ID']);
         return;
     }
-    
+
     $user_id = get_current_user_id();
     $video_url = get_post_meta($video_id, '_video_url', true);
-    
     if (empty($video_url)) {
         wp_send_json_error(['message' => 'Video not found']);
         return;
     }
-    
-    // Get IP address (handle proxy headers)
+
+    // Generate unique token
+    $token = wp_generate_uuid4();
+
     $ip = '';
     if (!empty($_SERVER['HTTP_CLIENT_IP'])) {
-        $ip = sanitize_text_field($_SERVER['HTTP_CLIENT_IP']);
+        $ip = $_SERVER['HTTP_CLIENT_IP'];
     } elseif (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-        $ip = sanitize_text_field($_SERVER['HTTP_X_FORWARDED_FOR']);
+        $ip = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR'])[0];
     } else {
-        $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : '';
+        $ip = $_SERVER['REMOTE_ADDR'] ?? '';
     }
+    $ip = sanitize_text_field($ip);
 
     $result = $wpdb->insert($wpdb->prefix.'video_clicks', [
-        'user_id' => $user_id ? $user_id : null,
+        'user_id' => $user_id ?: null,
         'video_id' => $video_id,
         'video_url' => $video_url,
         'redirect_time' => current_time('mysql'),
-        'ip_address' => $ip
+        'ip_address' => $ip,
+        'return_token' => $token
     ], [
-        '%d', '%d', '%s', '%s', '%s'
+        '%d', '%d', '%s', '%s', '%s', '%s'
     ]);
 
     if ($result === false) {
         wp_send_json_error(['message' => 'Failed to track click']);
     } else {
-        wp_send_json_success(['message' => 'Click tracked']);
+        wp_send_json_success([
+            'message' => 'Click tracked',
+            'token' => $token  // ← Important: return only the token
+        ]);
     }
 }
 
@@ -1521,6 +1576,71 @@ function bvt_claim_coins() {
         'message' => "Successfully claimed {$total_coins} coin(s) from {$claimed_count} video(s)!",
         'coins_claimed' => $total_coins,
         'new_balance' => $new_balance
+    ]);
+}
+
+
+/* =========================================
+ * AJAX: Mark return when user becomes active again
+ * ========================================= */
+add_action('wp_ajax_bvt_mark_return', 'bvt_mark_return');
+add_action('wp_ajax_nopriv_bvt_mark_return', 'bvt_mark_return');
+
+function bvt_mark_return() {
+    if (!isset($_POST['token']) || empty($_POST['token'])) {
+        wp_send_json_error(['message' => 'Invalid token']);
+        return;
+    }
+
+    global $wpdb;
+    $table = $wpdb->prefix . 'video_clicks';
+    $token = sanitize_text_field($_POST['token']);
+
+    // Find pending click with this token
+    $click = $wpdb->get_row($wpdb->prepare(
+        "SELECT * FROM $table WHERE return_token = %s AND return_time IS NULL LIMIT 1",
+        $token
+    ));
+
+    if (!$click) {
+        wp_send_json_error(['message' => 'No pending session or already returned']);
+        return;
+    }
+
+    $return_time = current_time('mysql');
+
+    // Record return
+    $wpdb->update($table, ['return_time' => $return_time], ['id' => $click->id]);
+
+    $user_id = get_current_user_id();
+
+    // Only logged-in users can earn coins
+    if ($user_id > 0 && $click->redirect_time) {
+        $redirect_date = date('Y-m-d', strtotime($click->redirect_time));
+        $return_date   = date('Y-m-d', strtotime($return_time));
+
+        if ($redirect_date === $return_date) {
+            $watched_minutes = (strtotime($return_time) - strtotime($click->redirect_time)) / 60;
+
+            if ($watched_minutes > 2) {
+                $wpdb->update($table, [
+                    'coins_eligible' => 1,
+                    'coins_eligible_at' => $return_time
+                ], ['id' => $click->id]);
+
+                wp_send_json_success([
+                    'message' => 'Return confirmed! You watched more than 2 minutes.',
+                    'eligible' => true,
+                    'watched_minutes' => round($watched_minutes, 1)
+                ]);
+                return;
+            }
+        }
+    }
+
+    wp_send_json_success([
+        'message' => 'Return recorded.',
+        'eligible' => false
     ]);
 }
 
@@ -1608,3 +1728,92 @@ add_action('wp', function() {
         }
     }
 });    
+
+
+
+/* =========================================
+ * RETURN DETECTION PAGE WITH TOKEN
+ * ========================================= */
+
+// Add rewrite rule for /video-return/
+add_action('init', function() {
+    add_rewrite_rule('^video-return/?$', 'index.php?bvt_return=1', 'top');
+});
+
+// Register query var
+add_filter('query_vars', function($vars) {
+    $vars[] = 'bvt_return';
+    return $vars;
+});
+
+// Handle the return page
+add_action('template_redirect', function() {
+    if (get_query_var('bvt_return')) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'video_clicks';
+
+        $token = sanitize_text_field($_GET['token'] ?? '');
+
+        if (empty($token)) {
+            wp_die('Invalid or missing return token.', 'Error', ['response' => 400]);
+        }
+
+        // Find pending click with this token
+        $click = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM $table WHERE return_token = %s AND return_time IS NULL LIMIT 1",
+            $token
+        ));
+
+        if (!$click) {
+            wp_die('This return link is invalid or has already been used.', 'Invalid Link', ['response' => 410]);
+        }
+
+        $return_time = current_time('mysql');
+
+        // Record return time
+        $wpdb->update(
+            $table,
+            ['return_time' => $return_time],
+            ['id' => $click->id]
+        );
+
+        $user_id = get_current_user_id();
+
+        // Only award coins if logged in, same date, and watched >2 minutes
+        if ($user_id > 0 && $click->redirect_time) {
+            $redirect_date = date('Y-m-d', strtotime($click->redirect_time));
+            $return_date   = date('Y-m-d', strtotime($return_time));
+
+            if ($redirect_date === $return_date) {
+                $time_diff_minutes = (strtotime($return_time) - strtotime($click->redirect_time)) / 60;
+
+                if ($time_diff_minutes > 2) {
+                    $wpdb->update($table, [
+                        'coins_eligible' => 1,
+                        'coins_eligible_at' => $return_time
+                    ], ['id' => $click->id]);
+                }
+            }
+        }
+
+        // Nice success message
+        wp_die(
+            '<div style="font-family: Arial, sans-serif; text-align: center; padding: 50px; max-width: 600px; margin: 0 auto;">
+                <h1 style="color: #2271b1;">🎉 Thank You for Watching!</h1>
+                <p style="font-size: 18px;">You have successfully returned after watching the video.</p>
+                ' . ($user_id > 0
+                    ? '<p style="color: green; font-weight: bold;">You are now eligible to claim 1 coin (if watched more than 2 minutes).</p>'
+                    : '<p>Please <a href="' . wp_login_url() . '">log in</a> to earn coins next time.</p>'
+                ) . '
+                <hr style="margin: 30px 0;">
+                <a href="' . home_url() . '" style="background: #2271b1; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-size: 16px;">← Back to Video Gallery</a>
+            </div>',
+            'Video Watched Successfully',
+            ['response' => 200]
+        );
+    }
+});
+
+
+
+
