@@ -425,14 +425,17 @@ function bvt_video_management_page() {
                         ));
                         
                         // Get coins claimed count for this video
-                        $coins_claimed_count = $wpdb->get_var($wpdb->prepare(
-                            "SELECT COUNT(*) 
-                             FROM $coins_table ucc
-                             INNER JOIN $table vc ON ucc.click_id = vc.id
-                             WHERE vc.video_id = %d 
-                             AND ucc.transaction_type = 'claim'",
-                            $video_id
-                        ));
+                      // Get TOTAL coins awarded for this video (from both claim and watch_reward)
+// Get TOTAL coins awarded for this video (from both claim and auto-reward)
+$coins_claimed_count = $wpdb->get_var($wpdb->prepare(
+    "SELECT COALESCE(SUM(ucc.coins_amount), 0)
+     FROM $coins_table ucc
+     INNER JOIN $table vc ON ucc.click_id = vc.id
+     WHERE vc.video_id = %d
+     AND ucc.transaction_type IN ('claim', 'watch_reward')",
+    $video_id
+));
+$coins_claimed_count = intval($coins_claimed_count);
                         
                         // Get uploader name
                         if ($uploaded_by) {
@@ -537,14 +540,16 @@ function bvt_all_videos_page() {
                         ));
                         
                         // Get coins claimed count for this video
-                        $coins_claimed_count = $wpdb->get_var($wpdb->prepare(
-                            "SELECT COUNT(*) 
-                             FROM $coins_table ucc
-                             INNER JOIN $table vc ON ucc.click_id = vc.id
-                             WHERE vc.video_id = %d 
-                             AND ucc.transaction_type = 'claim'",
-                            $video_id
-                        ));
+                       // Get TOTAL coins awarded for this video (from both claim and watch_reward)
+$coins_claimed_count = $wpdb->get_var($wpdb->prepare(
+    "SELECT SUM(ucc.coins_amount)
+     FROM $coins_table ucc
+     INNER JOIN $table vc ON ucc.click_id = vc.id
+     WHERE vc.video_id = %d
+     AND ucc.transaction_type IN ('claim', 'watch_reward')",
+    $video_id
+));
+$coins_claimed_count = $coins_claimed_count ? intval($coins_claimed_count) : 0;
                     ?>
                         <tr>
                             <td><?php echo $video_id; ?></td>
@@ -1499,8 +1504,12 @@ function bvt_upload_video() {
         'meta_input' => [
             '_video_url' => $video_url,
             '_uploaded_by' => $user_id,
+			'_upload_plan' => $selected_plan,
         ],
     ]);
+	
+	// Also save it after (in case meta_input doesn't work)
+update_post_meta($result, '_upload_plan', $selected_plan);
 
     if (is_wp_error($result)) {
         wp_send_json_error(['message' => 'Failed to save video. Try again.']);
@@ -1665,6 +1674,11 @@ function bvt_claim_coins() {
     // Get new total balance
     $new_balance = bvt_get_user_coins($user_id);
     
+	// Check all videos this user claimed from in this batch
+foreach ($eligible_clicks as $click) {
+    bvt_check_and_hide_video_if_limit_reached($click->video_id);
+}
+	
     wp_send_json_success([
         'message' => "Successfully claimed {$total_coins} coin(s) from {$claimed_count} video(s)!",
         'coins_claimed' => $total_coins,
@@ -1718,30 +1732,32 @@ function bvt_mark_return() {
             $watched_minutes = (strtotime($return_time) - strtotime($click->redirect_time)) / 60;
 
             if ($watched_minutes > 1 && $click->coins_awarded == 0) {
-                // Award 1 coin directly
-                $wpdb->insert($coins_table, [
-                    'user_id' => $user_id,
-                    'click_id' => $click->id,
-                    'coins_amount' => 10,
-                    'claimed_at' => current_time('mysql'),
-                    'transaction_type' => 'watch_reward'
-                ]);
+    // Award 10 coins directly (auto-reward)
+    $wpdb->insert($coins_table, [
+        'user_id' => $user_id,
+        'click_id' => $click->id,
+        'coins_amount' => 10,
+        'claimed_at' => current_time('mysql'),
+        'transaction_type' => 'watch_reward'
+    ]);
 
-                // Mark as awarded
-                $wpdb->update($table, [
-                    'coins_awarded' => 1,
-                    'coins_eligible' => 1,
-                    'coins_eligible_at' => $return_time
-                ], ['id' => $click->id]);
+    // Mark as awarded — DO NOT set coins_eligible = 1 (prevents manual claim)
+    $wpdb->update($table, [
+        'coins_awarded' => 1
+        // Remove coins_eligible and coins_eligible_at
+    ], ['id' => $click->id]);
 
-                wp_send_json_success([
-                    'message' => 'Success! You earned 10 coin for watching the video!',
-                    'eligible' => true,
-                    'coin_awarded' => true,
-                    'watched_minutes' => round($watched_minutes, 1)
-                ]);
-                return;
-            }
+    // Check if video reached coin limit and hide
+    bvt_check_and_hide_video_if_limit_reached($click->video_id);
+
+    wp_send_json_success([
+        'message' => 'Success! You earned 10 coins for watching the video!',
+        'eligible' => false,
+        'coin_awarded' => true,
+        'watched_minutes' => round($watched_minutes, 1)
+    ]);
+    return;
+}
         }
     }
 
@@ -1895,10 +1911,10 @@ add_action('template_redirect', function() {
                 $time_diff_minutes = (strtotime($return_time) - strtotime($click->redirect_time)) / 60;
 
                 if ($time_diff_minutes > 2) {
-                    $wpdb->update($table, [
-                        'coins_eligible' => 1,
-                        'coins_eligible_at' => $return_time
-                    ], ['id' => $click->id]);
+//                     $wpdb->update($table, [
+//                         'coins_eligible' => 1,
+//                         'coins_eligible_at' => $return_time
+//                     ], ['id' => $click->id]);
                 }
             }
         }
@@ -1922,5 +1938,44 @@ add_action('template_redirect', function() {
 });
 
 
+/* =========================================
+ * CHECK AND HIDE VIDEO IF COIN LIMIT REACHED
+ * ========================================= */
+function bvt_check_and_hide_video_if_limit_reached($video_id) {
+    global $wpdb;
+    $coins_table = $wpdb->prefix . 'user_claim_coins';
+    $clicks_table = $wpdb->prefix . 'video_clicks';
 
+    // Get total coins awarded for this video
+    $total_coins = $wpdb->get_var($wpdb->prepare(
+        "SELECT COALESCE(SUM(ucc.coins_amount), 0)
+         FROM $coins_table ucc
+         INNER JOIN $clicks_table vc ON ucc.click_id = vc.id
+         WHERE vc.video_id = %d
+         AND ucc.transaction_type IN ('claim', 'watch_reward')",
+        $video_id
+    ));
+    $total_coins = intval($total_coins);
+
+    // Get the plan used to upload this video
+    $upload_plan = get_post_meta($video_id, '_upload_plan', true);
+    $upload_plan = trim($upload_plan);
+
+    $limit = 0;
+    if ($upload_plan === '1') {
+        $limit = 1000;
+    } elseif (in_array($upload_plan, ['10', '99'])) {
+        $limit = 10000;
+    }
+
+    // If limit reached and not already hidden → hide it
+    if ($limit > 0 && $total_coins >= $limit) {
+        $already_hidden = get_post_meta($video_id, '_video_hidden', true);
+        if (!$already_hidden) {
+            update_post_meta($video_id, '_video_hidden', 1);
+            // Optional: log it
+            error_log("Video ID {$video_id} auto-hidden: reached {$total_coins} coins (Plan {$upload_plan})");
+        }
+    }
+}
 
