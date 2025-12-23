@@ -1,564 +1,1281 @@
 <?php
 /*
-Plugin Name: Bulk Video Tracker with Coins
-Description: Bulk upload video URLs, show thumbnails with play button, redirect users, track redirect & return time, and claim coins.
-Version: 1.2
+Plugin Name: Bulk Video Tracker
+Description: Bulk upload YouTube/Facebook/Instagram videos, show thumbnails with play button, redirect users, and track clicks and returns.
+Version: 1.0
 Author: Bhagwan Singh
 */
 
 if (!defined('ABSPATH')) exit;
 
-/* =====================================================
- * CUSTOM POST TYPE
- * ===================================================== */
+/* =========================================
+ * REGISTER CUSTOM POST TYPE
+ * ========================================= */
 add_action('init', function () {
     register_post_type('video_link', [
         'labels' => [
             'name' => 'Video Links',
-            'singular_name' => 'Video Link'
+            'singular_name' => 'Video Link',
         ],
         'public' => true,
-        'show_in_menu' => false,
+        'show_in_menu' => false, // Hide from main menu, use custom menu instead
+        'menu_icon' => 'dashicons-video-alt3',
         'supports' => ['title'],
     ]);
 });
 
-/* =====================================================
- * DATABASE TABLE
- * ===================================================== */
-register_activation_hook(__FILE__, function () {
+/* =========================================
+ * CREATE DATABASE TABLE FOR TRACKING
+ * ========================================= */
+register_activation_hook(__FILE__, function() {
     global $wpdb;
-    $table = $wpdb->prefix . 'video_clicks';
+    $table = $wpdb->prefix.'video_clicks';
+    $coins_table = $wpdb->prefix.'user_claim_coins';
     $charset = $wpdb->get_charset_collate();
 
-    $sql = "CREATE TABLE $table (
+    // Create video clicks table
+    $sql = "CREATE TABLE IF NOT EXISTS $table (
         id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
         user_id BIGINT(20) DEFAULT NULL,
-        video_id BIGINT(20) NOT NULL,
+        video_id BIGINT(20) DEFAULT NULL,
         video_url TEXT NOT NULL,
         redirect_time DATETIME DEFAULT NULL,
         return_time DATETIME DEFAULT NULL,
-        coins INT DEFAULT 10,
-        claimed TINYINT(1) DEFAULT 0,
-        session_key VARCHAR(100),
-        ip_address VARCHAR(100),
+        ip_address VARCHAR(100) DEFAULT NULL,
+        coins_eligible TINYINT(1) DEFAULT 0,
+        coins_claimed TINYINT(1) DEFAULT 0,
         PRIMARY KEY (id)
     ) $charset;";
 
-    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    // Create user claim coins table (also stores deductions with negative amounts)
+    $sql2 = "CREATE TABLE IF NOT EXISTS $coins_table (
+        id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT(20) NOT NULL,
+        click_id BIGINT(20) DEFAULT NULL,
+        coins_amount INT(11) DEFAULT 1,
+        claimed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        transaction_type VARCHAR(20) DEFAULT 'claim',
+        video_upload_id BIGINT(20) DEFAULT NULL,
+        PRIMARY KEY (id),
+        KEY user_id (user_id),
+        KEY click_id (click_id)
+    ) $charset;";
+
+    require_once(ABSPATH.'wp-admin/includes/upgrade.php');
     dbDelta($sql);
+    dbDelta($sql2);
+    
+    // Add new columns to existing table if they don't exist
+    $columns = $wpdb->get_col("DESCRIBE $table");
+    if (!in_array('coins_eligible', $columns)) {
+        $wpdb->query("ALTER TABLE $table ADD COLUMN coins_eligible TINYINT(1) DEFAULT 0");
+    }
+    if (!in_array('coins_claimed', $columns)) {
+        $wpdb->query("ALTER TABLE $table ADD COLUMN coins_claimed TINYINT(1) DEFAULT 0");
+    }
+    if (!in_array('coins_eligible_at', $columns)) {
+        $wpdb->query("ALTER TABLE $table ADD COLUMN coins_eligible_at DATETIME DEFAULT NULL");
+    }
+    
+    // Add new columns to coins table if they don't exist
+    $coins_columns = $wpdb->get_col("DESCRIBE $coins_table");
+    if (!in_array('transaction_type', $coins_columns)) {
+        $wpdb->query("ALTER TABLE $coins_table ADD COLUMN transaction_type VARCHAR(20) DEFAULT 'claim'");
+    }
+    if (!in_array('video_upload_id', $coins_columns)) {
+        $wpdb->query("ALTER TABLE $coins_table ADD COLUMN video_upload_id BIGINT(20) DEFAULT NULL");
+    }
+    // Update click_id to allow NULL if it doesn't already
+    $click_id_info = $wpdb->get_row("SHOW COLUMNS FROM $coins_table WHERE Field = 'click_id'");
+    if ($click_id_info && $click_id_info->Null === 'NO') {
+        $wpdb->query("ALTER TABLE $coins_table MODIFY COLUMN click_id BIGINT(20) DEFAULT NULL");
+    }
 });
 
-/* =====================================================
- * ADMIN MENU + SUBMENUS
- * ===================================================== */
+/* =========================================
+ * HELPER FUNCTION: GET USER COIN BALANCE
+ * ========================================= */
+function bvt_get_user_coins($user_id) {
+    if (!$user_id) return 0;
+    global $wpdb;
+    $coins_table = $wpdb->prefix . 'user_claim_coins';
+    $total = $wpdb->get_var($wpdb->prepare(
+        "SELECT SUM(coins_amount) FROM $coins_table WHERE user_id = %d",
+        $user_id
+    ));
+    return $total ? intval($total) : 0;
+}
+
+/* =========================================
+ * HELPER FUNCTION: GET VIDEO THUMBNAIL
+ * ========================================= */
+function bvt_get_video_thumbnail($url) {
+    $thumbnail = '';
+    // Get YouTube thumbnail
+    if (strpos($url, 'youtube.com') !== false || strpos($url, 'youtu.be') !== false) {
+        preg_match("#(?<=v=|youtu.be/)[a-zA-Z0-9_-]+#", $url, $matches);
+        if (!empty($matches[0])) {
+            $thumbnail = 'https://img.youtube.com/vi/'.$matches[0].'/hqdefault.jpg';
+        }
+    }
+    // For simplicity, Facebook/Instagram placeholders
+    if (!$thumbnail) $thumbnail = 'https://via.placeholder.com/480x270?text=Video';
+    return $thumbnail;
+}
+
+/* =========================================
+ * ADMIN MENU PAGE WITH SUB-MENUS
+ * ========================================= */
 add_action('admin_menu', function () {
-    add_menu_page('Bulk Video Tracker', 'Bulk Video Tracker', 'manage_options', 'bulk-video-tracker', 'bvt_bulk_upload_page', 'dashicons-video-alt3', 25);
-    add_submenu_page('bulk-video-tracker', 'Bulk Upload', 'Bulk Upload', 'manage_options', 'bulk-video-tracker', 'bvt_bulk_upload_page');
-    add_submenu_page('bulk-video-tracker', 'Video Links', 'Video Links', 'manage_options', 'edit.php?post_type=video_link');
-    add_submenu_page('bulk-video-tracker', 'User Tracking', 'User Tracking', 'manage_options', 'bvt-user-tracking', 'bvt_user_tracking_page');
+    // Main menu
+    add_menu_page(
+        'Bulk Video Tracker',
+        'Video Tracker',
+        'manage_options',
+        'bulk-video-upload',
+        'bvt_admin_page',
+        'dashicons-video-alt2'
+    );
+    
+    // Sub-menu: Bulk Upload (same as main page)
+    add_submenu_page(
+        'bulk-video-upload',
+        'Bulk Upload',
+        'Bulk Upload',
+        'manage_options',
+        'bulk-video-upload',
+        'bvt_admin_page'
+    );
+    
+    // Sub-menu: Video Management (new comprehensive page)
+    add_submenu_page(
+        'bulk-video-upload',
+        'Video Management',
+        'Video Management',
+        'manage_options',
+        'bvt-video-management',
+        'bvt_video_management_page'
+    );
+    
+    // Sub-menu: All Videos (keep for backward compatibility)
+    add_submenu_page(
+        'bulk-video-upload',
+        'All Videos',
+        'All Videos',
+        'manage_options',
+        'bvt-all-videos',
+        'bvt_all_videos_page'
+    );
+    
+    // Sub-menu: Tracking Stats
+    add_submenu_page(
+        'bulk-video-upload',
+        'Tracking Stats',
+        'Tracking Stats',
+        'manage_options',
+        'bvt-tracking-stats',
+        'bvt_tracking_stats_page'
+    );
 });
 
-/* =====================================================
- * BULK UPLOAD PAGE
- * ===================================================== */
-function bvt_bulk_upload_page() {
+function bvt_admin_page() {
+    // Show success message
+    if (isset($_GET['success']) && $_GET['success'] == '1') {
+        echo '<div class="notice notice-success is-dismissible"><p>Videos uploaded successfully!</p></div>';
+    }
+    if (isset($_GET['error'])) {
+        $error_msg = sanitize_text_field($_GET['error']);
+        echo '<div class="notice notice-error is-dismissible"><p>Error: ' . esc_html($error_msg) . '</p></div>';
+    }
     ?>
     <div class="wrap">
-        <h1>Bulk Upload Video URLs</h1>
+        <h1>Bulk Video URL Upload</h1>
         <form method="post">
-            <?php wp_nonce_field('bvt_nonce'); ?>
-            <textarea name="urls" rows="10" style="width:100%" placeholder="Paste one video URL per line (YouTube / Facebook / Instagram)"></textarea>
-            <p><button class="button button-primary" name="bvt_submit">Upload Videos</button></p>
+            <?php wp_nonce_field('bvt_upload_nonce'); ?>
+            <textarea name="video_urls" rows="10" style="width:100%;" placeholder="Paste video URLs (one per line)..."></textarea>
+            <p>
+                <button type="submit" name="bvt_submit" class="button button-primary">Upload Videos</button>
+            </p>
         </form>
     </div>
     <?php
 }
 
-/* =====================================================
+/* =========================================
+ * VIDEO MANAGEMENT PAGE (Comprehensive)
+ * ========================================= */
+function bvt_video_management_page() {
+    global $wpdb;
+    
+    // Handle actions
+    if (isset($_GET['action']) && isset($_GET['video_id'])) {
+        if (!current_user_can('manage_options')) {
+            wp_die('Unauthorized');
+        }
+        
+        $video_id = intval($_GET['video_id']);
+        $action = sanitize_text_field($_GET['action']);
+        
+        if ($action == 'delete') {
+            check_admin_referer('delete_video_' . $video_id);
+            wp_delete_post($video_id, true);
+            echo '<div class="notice notice-success is-dismissible"><p>Video deleted successfully!</p></div>';
+        } elseif ($action == 'hide') {
+            check_admin_referer('hide_video_' . $video_id);
+            update_post_meta($video_id, '_video_hidden', 1);
+            echo '<div class="notice notice-success is-dismissible"><p>Video hidden from frontend!</p></div>';
+        } elseif ($action == 'show') {
+            check_admin_referer('show_video_' . $video_id);
+            delete_post_meta($video_id, '_video_hidden');
+            echo '<div class="notice notice-success is-dismissible"><p>Video shown on frontend!</p></div>';
+        }
+    }
+    
+    // Get filter parameters
+    $filter_uploader = isset($_GET['filter_uploader']) ? sanitize_text_field($_GET['filter_uploader']) : '';
+    $filter_status = isset($_GET['filter_status']) ? sanitize_text_field($_GET['filter_status']) : '';
+    $search_term = isset($_GET['s']) ? sanitize_text_field($_GET['s']) : '';
+    
+    // Build query
+    $query_args = [
+        'post_type' => 'video_link',
+        'posts_per_page' => -1,
+        'orderby' => 'date',
+        'order' => 'DESC',
+    ];
+    
+    // Apply filters
+    $meta_query = [];
+    if ($filter_uploader == 'admin') {
+        $meta_query[] = [
+            'key' => '_uploaded_by',
+            'compare' => 'NOT EXISTS'
+        ];
+    } elseif ($filter_uploader == 'user') {
+        $meta_query[] = [
+            'key' => '_uploaded_by',
+            'compare' => 'EXISTS'
+        ];
+    }
+    
+    if ($filter_status == 'hidden') {
+        $meta_query[] = [
+            'key' => '_video_hidden',
+            'value' => '1',
+            'compare' => '='
+        ];
+    } elseif ($filter_status == 'visible') {
+        $meta_query[] = [
+            'key' => '_video_hidden',
+            'compare' => 'NOT EXISTS'
+        ];
+    }
+    
+    if (!empty($meta_query)) {
+        $query_args['meta_query'] = $meta_query;
+    }
+    
+    if (!empty($search_term)) {
+        $query_args['s'] = $search_term;
+    }
+    
+    $query = new WP_Query($query_args);
+    $table = $wpdb->prefix . 'video_clicks';
+    
+    ?>
+    <div class="wrap">
+        <h1>Video Management</h1>
+        
+        <!-- Filters -->
+        <div class="tablenav top" style="margin: 20px 0;">
+            <form method="get" style="display: inline-block;">
+                <input type="hidden" name="page" value="bvt-video-management">
+                
+                <label for="filter_uploader" style="margin-right: 10px;">Uploader:</label>
+                <select name="filter_uploader" id="filter_uploader" style="margin-right: 15px;">
+                    <option value="">All</option>
+                    <option value="admin" <?php selected($filter_uploader, 'admin'); ?>>Admin</option>
+                    <option value="user" <?php selected($filter_uploader, 'user'); ?>>Users</option>
+                </select>
+                
+                <label for="filter_status" style="margin-right: 10px;">Status:</label>
+                <select name="filter_status" id="filter_status" style="margin-right: 15px;">
+                    <option value="">All</option>
+                    <option value="visible" <?php selected($filter_status, 'visible'); ?>>Visible</option>
+                    <option value="hidden" <?php selected($filter_status, 'hidden'); ?>>Hidden</option>
+                </select>
+                
+                <label for="s" style="margin-right: 10px;">Search:</label>
+                <input type="text" name="s" id="s" value="<?php echo esc_attr($search_term); ?>" placeholder="Video URL..." style="margin-right: 10px;">
+                
+                <button type="submit" class="button">Filter</button>
+                <a href="?page=bvt-video-management" class="button">Reset</a>
+            </form>
+        </div>
+        
+        <table class="wp-list-table widefat fixed striped">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Video URL</th>
+                    <th>Uploaded By</th>
+                    <th>Date Added</th>
+                    <th>Total Clicks</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if ($query->have_posts()) : ?>
+                    <?php while ($query->have_posts()) : $query->the_post(); 
+                        $video_id = get_the_ID();
+                        $video_url = get_post_meta($video_id, '_video_url', true);
+                        $uploaded_by = get_post_meta($video_id, '_uploaded_by', true);
+                        $is_hidden = get_post_meta($video_id, '_video_hidden', true);
+                        
+                        // Get click count
+                        $click_count = $wpdb->get_var($wpdb->prepare(
+                            "SELECT COUNT(*) FROM $table WHERE video_id = %d",
+                            $video_id
+                        ));
+                        
+                        // Get uploader name
+                        if ($uploaded_by) {
+                            $uploader = get_userdata($uploaded_by);
+                            $uploader_name = $uploader ? $uploader->display_name . ' (User ID: ' . $uploaded_by . ')' : 'User ID: ' . $uploaded_by;
+                        } else {
+                            $uploader_name = 'Admin';
+                        }
+                    ?>
+                        <tr>
+                            <td><?php echo $video_id; ?></td>
+                            <td><a href="<?php echo esc_url($video_url); ?>" target="_blank"><?php echo esc_html($video_url); ?></a></td>
+                            <td><?php echo esc_html($uploader_name); ?></td>
+                            <td><?php echo get_the_date('Y-m-d H:i:s'); ?></td>
+                            <td><strong><?php echo intval($click_count); ?></strong></td>
+                            <td>
+                                <?php if ($is_hidden) : ?>
+                                    <span style="color: red; font-weight: bold;">Hidden</span>
+                                <?php else : ?>
+                                    <span style="color: green; font-weight: bold;">Visible</span>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?php if ($is_hidden) : ?>
+                                    <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=bvt-video-management&action=show&video_id=' . $video_id), 'show_video_' . $video_id); ?>" 
+                                       class="button button-small">Show</a>
+                                <?php else : ?>
+                                    <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=bvt-video-management&action=hide&video_id=' . $video_id), 'hide_video_' . $video_id); ?>" 
+                                       class="button button-small">Hide</a>
+                                <?php endif; ?>
+                                <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=bvt-video-management&action=delete&video_id=' . $video_id), 'delete_video_' . $video_id); ?>" 
+                                   onclick="return confirm('Are you sure you want to delete this video?');" 
+                                   class="button button-small" style="color: #dc3232;">Delete</a>
+                            </td>
+                        </tr>
+                    <?php endwhile; ?>
+                <?php else : ?>
+                    <tr>
+                        <td colspan="7">No videos found.</td>
+                    </tr>
+                <?php endif; ?>
+            </tbody>
+        </table>
+        
+        <p style="margin-top: 20px;">
+            <strong>Total Videos:</strong> <?php echo $query->found_posts; ?>
+        </p>
+    </div>
+    <?php
+    wp_reset_postdata();
+}
+
+/* =========================================
+ * ALL VIDEOS ADMIN PAGE (Legacy)
+ * ========================================= */
+function bvt_all_videos_page() {
+    global $wpdb;
+    
+    // Handle delete action
+    if (isset($_GET['action']) && $_GET['action'] == 'delete' && isset($_GET['video_id'])) {
+        if (!current_user_can('manage_options')) {
+            wp_die('Unauthorized');
+        }
+        check_admin_referer('delete_video_' . intval($_GET['video_id']));
+        wp_delete_post(intval($_GET['video_id']), true);
+        echo '<div class="notice notice-success is-dismissible"><p>Video deleted successfully!</p></div>';
+    }
+    
+    $query = new WP_Query([
+        'post_type' => 'video_link',
+        'posts_per_page' => -1,
+        'orderby' => 'date',
+        'order' => 'DESC',
+    ]);
+    
+    ?>
+    <div class="wrap">
+        <h1>All Videos</h1>
+        <table class="wp-list-table widefat fixed striped">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Video URL</th>
+                    <th>Date Added</th>
+                    <th>Total Clicks</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if ($query->have_posts()) : ?>
+                    <?php while ($query->have_posts()) : $query->the_post(); 
+                        $video_id = get_the_ID();
+                        $video_url = get_post_meta($video_id, '_video_url', true);
+                        $click_count = $wpdb->get_var($wpdb->prepare(
+                            "SELECT COUNT(*) FROM {$wpdb->prefix}video_clicks WHERE video_id = %d",
+                            $video_id
+                        ));
+                    ?>
+                        <tr>
+                            <td><?php echo $video_id; ?></td>
+                            <td><a href="<?php echo esc_url($video_url); ?>" target="_blank"><?php echo esc_html($video_url); ?></a></td>
+                            <td><?php echo get_the_date(); ?></td>
+                            <td><?php echo intval($click_count); ?></td>
+                            <td>
+                                <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=bvt-all-videos&action=delete&video_id=' . $video_id), 'delete_video_' . $video_id); ?>" 
+                                   onclick="return confirm('Are you sure you want to delete this video?');" 
+                                   class="button button-small">Delete</a>
+                            </td>
+                        </tr>
+                    <?php endwhile; ?>
+                <?php else : ?>
+                    <tr>
+                        <td colspan="5">No videos found.</td>
+                    </tr>
+                <?php endif; ?>
+            </tbody>
+        </table>
+    </div>
+    <?php
+    wp_reset_postdata();
+}
+
+/* =========================================
+ * TRACKING STATS ADMIN PAGE
+ * ========================================= */
+function bvt_tracking_stats_page() {
+    global $wpdb;
+    $table = $wpdb->prefix . 'video_clicks';
+    
+    // Get statistics
+    $total_clicks = $wpdb->get_var("SELECT COUNT(*) FROM $table");
+    $total_returns = $wpdb->get_var("SELECT COUNT(*) FROM $table WHERE return_time IS NOT NULL");
+    $pending_returns = $wpdb->get_var("SELECT COUNT(*) FROM $table WHERE return_time IS NULL");
+    
+    // Get recent clicks
+    $recent_clicks = $wpdb->get_results(
+        "SELECT c.*, p.post_title as video_url 
+         FROM $table c 
+         LEFT JOIN {$wpdb->posts} p ON c.video_id = p.ID 
+         ORDER BY c.redirect_time DESC 
+         LIMIT 50"
+    );
+    
+    ?>
+    <div class="wrap">
+        <h1>Tracking Statistics</h1>
+        
+        <div class="card" style="max-width: 800px; margin: 20px 0;">
+            <h2>Overview</h2>
+            <table class="form-table">
+                <tr>
+                    <th>Total Clicks:</th>
+                    <td><strong><?php echo intval($total_clicks); ?></strong></td>
+                </tr>
+                <tr>
+                    <th>Total Returns:</th>
+                    <td><strong><?php echo intval($total_returns); ?></strong></td>
+                </tr>
+                <tr>
+                    <th>Pending Returns:</th>
+                    <td><strong><?php echo intval($pending_returns); ?></strong></td>
+                </tr>
+                <tr>
+                    <th>Return Rate:</th>
+                    <td><strong><?php echo $total_clicks > 0 ? number_format(($total_returns / $total_clicks) * 100, 2) : 0; ?>%</strong></td>
+                </tr>
+            </table>
+        </div>
+        
+        <h2>Recent Clicks</h2>
+        <table class="wp-list-table widefat fixed striped">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>User ID</th>
+                    <th>Video URL</th>
+                    <th>Redirect Time</th>
+                    <th>Return Time</th>
+                    <th>IP Address</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if ($recent_clicks) : ?>
+                    <?php foreach ($recent_clicks as $click) : ?>
+                        <tr>
+                            <td><?php echo $click->id; ?></td>
+                            <td><?php echo $click->user_id ? $click->user_id : 'Guest'; ?></td>
+                            <td><?php echo esc_html($click->video_url); ?></td>
+                            <td><?php echo $click->redirect_time ? date('Y-m-d H:i:s', strtotime($click->redirect_time)) : '-'; ?></td>
+                            <td><?php echo $click->return_time ? date('Y-m-d H:i:s', strtotime($click->return_time)) : '<span style="color:red;">Pending</span>'; ?></td>
+                            <td><?php echo esc_html($click->ip_address); ?></td>
+                            <td><?php echo $click->return_time ? '<span style="color:green;">Returned</span>' : '<span style="color:orange;">Not Returned</span>'; ?></td>
+                        </tr>
+                    <?php endforeach; ?>
+                <?php else : ?>
+                    <tr>
+                        <td colspan="7">No tracking data found.</td>
+                    </tr>
+                <?php endif; ?>
+            </tbody>
+        </table>
+    </div>
+    <?php
+}
+
+/* =========================================
  * HANDLE BULK UPLOAD
- * ===================================================== */
+ * ========================================= */
 add_action('admin_init', function () {
     if (!isset($_POST['bvt_submit'])) return;
     if (!current_user_can('manage_options')) return;
-    if (!wp_verify_nonce($_POST['_wpnonce'], 'bvt_nonce')) return;
+    if (!wp_verify_nonce($_POST['_wpnonce'], 'bvt_upload_nonce')) {
+        wp_redirect(admin_url('admin.php?page=bulk-video-upload&error=' . urlencode('Security check failed')));
+        exit;
+    }
 
-    $urls = explode("\n", sanitize_textarea_field($_POST['urls']));
+    $urls = explode("\n", sanitize_textarea_field($_POST['video_urls']));
+    $count = 0;
+    $errors = [];
+    
     foreach ($urls as $url) {
         $url = trim($url);
-        if (!$url) continue;
-        wp_insert_post([
+        if (empty($url)) continue;
+        
+        // Validate URL
+        if (!filter_var($url, FILTER_VALIDATE_URL)) {
+            $errors[] = "Invalid URL: " . esc_html($url);
+            continue;
+        }
+
+        $result = wp_insert_post([
             'post_type'   => 'video_link',
             'post_title'  => $url,
             'post_status' => 'publish',
-            'meta_input'  => ['_video_url' => esc_url_raw($url)]
+            'meta_input'  => [
+                '_video_url' => esc_url_raw($url),
+            ],
         ]);
+        
+        if (is_wp_error($result)) {
+            $errors[] = "Failed to add: " . esc_html($url);
+        } else {
+            $count++;
+        }
     }
 
-    wp_redirect(admin_url('admin.php?page=bulk-video-tracker&uploaded=1'));
+    if ($count > 0) {
+        $message = "Successfully uploaded {$count} video(s).";
+        if (!empty($errors)) {
+            $message .= " " . count($errors) . " error(s) occurred.";
+        }
+        wp_redirect(admin_url('admin.php?page=bulk-video-upload&success=1&count=' . $count));
+    } else {
+        $error_msg = !empty($errors) ? implode(', ', $errors) : 'No valid URLs found';
+        wp_redirect(admin_url('admin.php?page=bulk-video-upload&error=' . urlencode($error_msg)));
+    }
     exit;
 });
 
-/* =====================================================
- * GET VIDEO THUMBNAIL
- * ===================================================== */
-function bvt_get_thumbnail($url) {
-    if(strpos($url,'youtu')!==false){
-        preg_match("#(youtu.be/|v=)([^&?/]+)#",$url,$m);
-        if(!empty($m[2])) return 'https://img.youtube.com/vi/'.$m[2].'/hqdefault.jpg';
+/* =========================================
+ * FRONTEND SHORTCODE
+ * ========================================= */
+add_shortcode('video_links', function () {
+    global $wpdb;
+    $user_id = is_user_logged_in() ? get_current_user_id() : 0;
+    
+    // Get video IDs that should be hidden (claimed within last 12 hours by this user)
+    $hidden_video_ids = [];
+    if ($user_id > 0) {
+        $coins_table = $wpdb->prefix . 'user_claim_coins';
+        $table = $wpdb->prefix . 'video_clicks';
+        // Get videos where user claimed coins within last 12 hours
+        $hidden_videos = $wpdb->get_col($wpdb->prepare(
+            "SELECT DISTINCT c.video_id 
+             FROM $table c
+             INNER JOIN $coins_table ucc ON c.id = ucc.click_id
+             WHERE ucc.user_id = %d 
+             AND ucc.claimed_at >= DATE_SUB(NOW(), INTERVAL 12 HOUR)
+             AND c.video_id IS NOT NULL",
+            $user_id
+        ));
+        $hidden_video_ids = $hidden_videos ? array_map('intval', $hidden_videos) : [];
     }
-    if(strpos($url,'facebook.com')!==false){
-        $response = wp_remote_get('https://www.facebook.com/plugins/video/oembed.json/?url='.urlencode($url));
-        if(!is_wp_error($response)){
-            $body = json_decode(wp_remote_retrieve_body($response),true);
-            if(!empty($body['thumbnail_url'])) return esc_url($body['thumbnail_url']);
+    
+    // Get all videos (user-uploaded and admin-uploaded)
+    // First, get user-uploaded videos (priority)
+    $user_videos_args = [
+        'post_type' => 'video_link',
+        'posts_per_page' => -1,
+        'meta_query' => [
+            [
+                'key' => '_uploaded_by',
+                'compare' => 'EXISTS'
+            ],
+            [
+                'key' => '_video_hidden',
+                'compare' => 'NOT EXISTS'
+            ]
+        ],
+        'orderby' => 'date',
+        'order' => 'DESC'
+    ];
+    
+    // Exclude hidden videos if user is logged in
+    if (!empty($hidden_video_ids)) {
+        $user_videos_args['post__not_in'] = $hidden_video_ids;
+    }
+    
+    $user_videos_query = new WP_Query($user_videos_args);
+    
+    // Get admin-uploaded videos
+    $admin_videos_args = [
+        'post_type' => 'video_link',
+        'posts_per_page' => -1,
+        'meta_query' => [
+            [
+                'key' => '_uploaded_by',
+                'compare' => 'NOT EXISTS'
+            ],
+            [
+                'key' => '_video_hidden',
+                'compare' => 'NOT EXISTS'
+            ]
+        ],
+        'orderby' => 'date',
+        'order' => 'DESC'
+    ];
+    
+    // Exclude hidden videos if user is logged in
+    if (!empty($hidden_video_ids)) {
+        $admin_videos_args['post__not_in'] = $hidden_video_ids;
+    }
+    
+    $admin_videos_query = new WP_Query($admin_videos_args);
+
+    ob_start();
+
+    echo '<div class="video-links">';
+    
+    // Display user-uploaded videos first (priority)
+    if ($user_videos_query->have_posts()) {
+        while ($user_videos_query->have_posts()) {
+            $user_videos_query->the_post();
+            $video_id = get_the_ID();
+            $url = get_post_meta($video_id, '_video_url', true);
+            $thumbnail = bvt_get_video_thumbnail($url);
+            
+            echo '<div class="video-item" style="display:inline-block; margin:10px; text-align:center;">
+                    <div class="video-card" data-url="'.esc_url($url).'" data-id="'.$video_id.'" style="position:relative; cursor:pointer; display:inline-block;">
+                        <img src="'.$thumbnail.'" style="width:320px; height:180px; object-fit:cover;">
+                        <div style="position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); font-size:50px; color:#fff; pointer-events:none;">▶</div>
+                    </div>
+                  </div>';
+        }
+        wp_reset_postdata();
+    }
+    
+    // Display admin-uploaded videos (after user videos)
+    if ($admin_videos_query->have_posts()) {
+        while ($admin_videos_query->have_posts()) {
+            $admin_videos_query->the_post();
+            $video_id = get_the_ID();
+            $url = get_post_meta($video_id, '_video_url', true);
+            $thumbnail = bvt_get_video_thumbnail($url);
+            
+            echo '<div class="video-item" style="display:inline-block; margin:10px; text-align:center;">
+                    <div class="video-card" data-url="'.esc_url($url).'" data-id="'.$video_id.'" style="position:relative; cursor:pointer; display:inline-block;">
+                        <img src="'.$thumbnail.'" style="width:320px; height:180px; object-fit:cover;">
+                        <div style="position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); font-size:50px; color:#fff; pointer-events:none;">▶</div>
+                    </div>
+                  </div>';
+        }
+        wp_reset_postdata();
+    }
+
+    echo '</div>';
+    
+    // Show Claim Coins button for logged-in users with eligible coins (within 24 hours)
+    if (is_user_logged_in()) {
+        $user_id = get_current_user_id();
+        $table = $wpdb->prefix . 'video_clicks';
+        
+        // Get eligible but not claimed clicks for this user that are within 24 hours
+        $eligible_clicks = $wpdb->get_results($wpdb->prepare(
+            "SELECT id, video_id, video_url, redirect_time, return_time, coins_eligible_at 
+             FROM $table 
+             WHERE user_id = %d 
+             AND coins_eligible = 1 
+             AND coins_claimed = 0 
+             AND coins_eligible_at IS NOT NULL
+             AND coins_eligible_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+             ORDER BY id DESC",
+            $user_id
+        ));
+        
+        // Get total claimed coins
+        $total_coins = bvt_get_user_coins($user_id);
+        
+        if ($eligible_clicks || $total_coins > 0) {
+            echo '<div style="margin-top: 30px; padding: 20px; background: #f0f0f0; border-radius: 5px; text-align: center;">';
+            echo '<h3 style="margin-top: 0;">Your Coins: <span style="color: #ff6b00; font-size: 24px;">' . $total_coins . '</span></h3>';
+            
+            if ($eligible_clicks) {
+                $eligible_count = count($eligible_clicks);
+                // Calculate time remaining for oldest eligible click
+                $oldest_click = $eligible_clicks[0];
+                if ($oldest_click->coins_eligible_at) {
+                    $eligible_time = strtotime($oldest_click->coins_eligible_at);
+                    $expiry_time = $eligible_time + (24 * 60 * 60); // 24 hours
+                    $time_remaining = $expiry_time - time();
+                    $hours_remaining = floor($time_remaining / 3600);
+                    $minutes_remaining = floor(($time_remaining % 3600) / 60);
+                    
+                    if ($time_remaining > 0) {
+                        echo '<p>You have <strong>' . $eligible_count . '</strong> video(s) eligible for coins!</p>';
+                        echo '<p style="font-size: 12px; color: #666;">Time remaining to claim: <strong>' . $hours_remaining . 'h ' . $minutes_remaining . 'm</strong></p>';
+                        echo '<button id="bvt-claim-coins-btn" class="button button-primary" style="font-size: 16px; padding: 10px 20px;">Claim Coins</button>';
+                        echo '<div id="bvt-claim-message" style="margin-top: 10px;"></div>';
+                    }
+                } else {
+                    echo '<p>You have <strong>' . $eligible_count . '</strong> video(s) eligible for coins!</p>';
+                    echo '<button id="bvt-claim-coins-btn" class="button button-primary" style="font-size: 16px; padding: 10px 20px;">Claim Coins</button>';
+                    echo '<div id="bvt-claim-message" style="margin-top: 10px;"></div>';
+                }
+            }
+            
+            echo '</div>';
         }
     }
-    return 'https://via.placeholder.com/480x270?text=Video';
-}
 
-/* =====================================================
- * SHORTCODE [video_links]
- * ===================================================== */
-add_shortcode('video_links', function () {
-    $q = new WP_Query(['post_type' => 'video_link', 'posts_per_page'=>-1]);
-    ob_start();
-    echo '<div style="display:flex;flex-wrap:wrap;">';
-
-    while ($q->have_posts()) {
-        $q->the_post();
-        $id    = get_the_ID();
-        $url   = get_post_meta($id, '_video_url', true);
-        $thumb = bvt_get_thumbnail($url);
-
-        $claim_button = '';
-       if (is_user_logged_in()) {
-    global $wpdb;
-    $user_id = get_current_user_id();
-
-    // Check if the user already claimed this video
-    $claimed_row = $wpdb->get_row($wpdb->prepare(
-        "SELECT * FROM {$wpdb->prefix}video_clicks WHERE user_id=%d AND video_id=%d AND claimed=1",
-        $user_id, $id
-    ));
-    if ($claimed_row) continue; // Skip this video entirely
-
-    // Check for unclaimed coins ready to claim
-    $row = $wpdb->get_row($wpdb->prepare(
-        "SELECT * FROM {$wpdb->prefix}video_clicks WHERE user_id=%d AND video_id=%d AND claimed=0 AND coins>0",
-        $user_id, $id
-    ));
-    $claim_button = '';
-    if ($row) {
-        $redirect = strtotime($row->redirect_time);
-        $return   = strtotime($row->return_time);
-        $diff = $return - $redirect;
-        if ($diff >= 120) $claim_button = "<button class='bvt-claim' data-id='{$row->id}'>Claim Coins ({$row->coins})</button>";
-    }
-}
-
-
-        // Skip videos that already have claimed coins
-        if ($row && $row->claimed) continue;
-
-        ?>
-        <div class="video-card" data-id="<?php echo esc_attr($id); ?>" data-url="<?php echo esc_url($url); ?>" style="width:300px;margin:10px;cursor:pointer;position:relative">
-            <img src="<?php echo esc_url($thumb); ?>" style="width:100%;border-radius:6px;">
-            <span style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:50px;color:white;">▶</span>
-            <div style="margin-top:10px;"><?php echo $claim_button; ?></div>
-        </div>
-        <?php
-    }
-    echo '</div>';
-    wp_reset_postdata();
+    // Add JS to handle click & tracking
     ?>
-
     <script>
-    document.querySelectorAll('.video-card').forEach(card => {
-        card.addEventListener('click', e => {
-            if(e.target.tagName === 'BUTTON') return; // prevent conflict with claim button
-            fetch('<?php echo admin_url("admin-ajax.php"); ?>', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: 'action=bvt_track&video_id=' + card.dataset.id
-            }).then(() => { window.location.href = card.dataset.url; });
-        });
-    });
+    document.querySelectorAll('.video-card').forEach(function(card){
+        card.addEventListener('click', function(){
+            const videoId = card.dataset.id;
+            const videoUrl = card.dataset.url;
 
-    document.querySelectorAll('.bvt-claim').forEach(btn => {
-        btn.addEventListener('click', () => {
-            let id = btn.dataset.id;
-            fetch('<?php echo admin_url("admin-ajax.php"); ?>', {
-                method:'POST',
-                headers:{'Content-Type':'application/x-www-form-urlencoded'},
-                body:'action=bvt_claim_coins&id='+id
-            }).then(r=>r.json()).then(res=>{
-                if(res.success){
-                    btn.innerText = "Coins Claimed!";
-                    btn.disabled = true;
-                    btn.closest('.video-card').remove();
-                }
+            // Send AJAX to store redirect
+            fetch("<?php echo admin_url('admin-ajax.php'); ?>?action=bvt_track_redirect", {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {'Content-Type':'application/x-www-form-urlencoded'},
+                body: 'video_id=' + videoId
+            }).then(response => response.json()).then(data => {
+                // Redirect user to video (even if tracking fails)
+                window.location.href = videoUrl;
+            }).catch(error => {
+                // Still redirect even if AJAX fails
+                console.error('Tracking error:', error);
+                window.location.href = videoUrl;
             });
         });
     });
+    
+    // Handle Claim Coins button
+    const claimBtn = document.getElementById('bvt-claim-coins-btn');
+    if (claimBtn) {
+        claimBtn.addEventListener('click', function() {
+            const btn = this;
+            const messageDiv = document.getElementById('bvt-claim-message');
+            btn.disabled = true;
+            btn.textContent = 'Claiming...';
+            
+            fetch("<?php echo admin_url('admin-ajax.php'); ?>?action=bvt_claim_coins", {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {'Content-Type':'application/x-www-form-urlencoded'},
+                body: 'action=claim'
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    messageDiv.innerHTML = '<div style="color: green; font-weight: bold;">' + data.data.message + '</div>';
+                    if (data.data.new_balance !== undefined) {
+                        // Update coin display
+                        const coinDisplay = document.querySelector('h3 span');
+                        if (coinDisplay) {
+                            coinDisplay.textContent = data.data.new_balance;
+                        }
+                    }
+                    btn.style.display = 'none';
+                    setTimeout(function() {
+                        location.reload();
+                    }, 2000);
+                } else {
+                    messageDiv.innerHTML = '<div style="color: red;">' + data.data.message + '</div>';
+                    btn.disabled = false;
+                    btn.textContent = 'Claim Coins';
+                }
+            })
+            .catch(error => {
+                messageDiv.innerHTML = '<div style="color: red;">Error claiming coins. Please try again.</div>';
+                btn.disabled = false;
+                btn.textContent = 'Claim Coins';
+            });
+        });
+    }
     </script>
-
     <?php
+
     return ob_get_clean();
 });
 
-/* =====================================================
- * TRACK REDIRECT
- * ===================================================== */
-add_action('wp_ajax_bvt_track','bvt_track');
-add_action('wp_ajax_nopriv_bvt_track','bvt_track');
-function bvt_track(){
-    global $wpdb;
-    $video_id = intval($_POST['video_id']);
-    $url = get_post_meta($video_id,'_video_url',true);
-    $session = uniqid('bvt_',true);
-    setcookie('bvt_session',$session,time()+3600,'/');
-    $wpdb->insert($wpdb->prefix.'video_clicks',[
-        'user_id'=>get_current_user_id(),
-        'video_id'=>$video_id,
-        'video_url'=>$url,
-        'redirect_time'=>current_time('mysql'),
-        'session_key'=>$session,
-        'ip_address'=>$_SERVER['REMOTE_ADDR']
-    ]);
-    wp_die();
-}
-
-/* =====================================================
- * CLAIM COINS AJAX
- * ===================================================== */
-add_action('wp_ajax_bvt_claim_coins','bvt_claim_coins');
-function bvt_claim_coins(){
-    global $wpdb;
-    $id = intval($_POST['id']);
-    $wpdb->update($wpdb->prefix.'video_clicks',['claimed'=>1],['id'=>$id]);
-    wp_send_json(['success'=>true]);
-}
-
-/* =====================================================
- * TRACK RETURN TIME
- * ===================================================== */
-add_action('init',function(){
-    if(empty($_COOKIE['bvt_session'])) return;
-    global $wpdb;
-    $session = sanitize_text_field($_COOKIE['bvt_session']);
-    $wpdb->update($wpdb->prefix.'video_clicks',['return_time'=>current_time('mysql')],['session_key'=>$session,'return_time'=>null]);
-    setcookie('bvt_session','',time()-3600,'/');
-});
-
-/* =====================================================
- * RESET UNCLAIMED COINS AFTER MIDNIGHT
- * ===================================================== */
-add_action('wp_loaded',function(){
-    global $wpdb;
-    $wpdb->query("UPDATE {$wpdb->prefix}video_clicks SET coins=0 WHERE claimed=0 AND DATE(redirect_time) < CURDATE()");
-});
-
-/* =====================================================
- * USER TRACKING ADMIN PAGE
- * ===================================================== */
-function bvt_user_tracking_page(){
-    global $wpdb;
-    $table = $wpdb->prefix.'video_clicks';
-    $rows  = $wpdb->get_results("SELECT * FROM $table ORDER BY id DESC");
-    ?>
-    <div class="wrap">
-        <h1>User Video Tracking</h1>
-        <table class="widefat fixed striped">
-            <thead>
-                <tr>
-                    <th>ID</th><th>User</th><th>Video URL</th><th>Redirect Time</th><th>Return Time</th>
-                    <th>Coins</th><th>Claimed</th><th>IP Address</th><th>Session</th>
-                </tr>
-            </thead>
-            <tbody>
-            <?php if($rows): foreach($rows as $row): ?>
-                <tr>
-                    <td><?php echo esc_html($row->id); ?></td>
-                    <td><?php echo $row->user_id ? esc_html(get_userdata($row->user_id)->user_login ?? 'User Deleted') : '<em>Guest</em>'; ?></td>
-                    <td style="max-width:300px;word-break:break-all"><a href="<?php echo esc_url($row->video_url); ?>" target="_blank"><?php echo esc_html($row->video_url); ?></a></td>
-                    <td><?php echo esc_html($row->redirect_time ?: '-'); ?></td>
-                    <td><?php echo esc_html($row->return_time ?: 'Not Returned'); ?></td>
-                    <td><?php echo esc_html($row->coins); ?></td>
-                    <td><?php echo esc_html($row->claimed); ?></td>
-                    <td><?php echo esc_html($row->ip_address); ?></td>
-                    <td><?php echo esc_html($row->session_key); ?></td>
-                </tr>
-            <?php endforeach; else: ?>
-                <tr><td colspan="9">No tracking data found.</td></tr>
-            <?php endif; ?>
-            </tbody>
-        </table>
-    </div>
-    <?php
-}
-
-/* =====================================================
- * ASSIGN COINS IF WATCHED >= 2 MINUTES
- * ===================================================== */
-add_action('init', function () {
-    global $wpdb;
-    $table = $wpdb->prefix . 'video_clicks';
-    $rows = $wpdb->get_results("SELECT * FROM $table WHERE redirect_time IS NOT NULL AND return_time IS NOT NULL AND coins=0");
-    foreach ($rows as $row) {
-        $redirect = strtotime($row->redirect_time);
-        $return   = strtotime($row->return_time);
-        if (($return - $redirect) >= 120) {
-            $wpdb->update($table, ['coins' => 10], ['id' => $row->id]);
-        }
-    }
-});
-
-
-/* =====================================================
- * USER WALLET SHORTCODE [vr_user_claims] – Only Claimed Coins
- * ===================================================== */
-add_shortcode('vr_user_claims', function() {
-
+/* =========================================
+ * FRONTEND VIDEO UPLOAD SHORTCODE
+ * ========================================= */
+add_shortcode('upload_video', function () {
     if (!is_user_logged_in()) {
-        return '<p>Please login to view your wallet.</p>';
+        return '<div style="padding: 20px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 5px; text-align: center;">
+                    <p>Please <a href="' . wp_login_url(get_permalink()) . '">login</a> to upload videos.</p>
+                </div>';
     }
-
-    global $wpdb;
+    
     $user_id = get_current_user_id();
-    $table   = $wpdb->prefix . 'video_clicks';
-
-    // Wallet balance (include negative coins)
-    $total_coins = (int) $wpdb->get_var(
-        $wpdb->prepare(
-            "SELECT COALESCE(SUM(coins),0)
-             FROM $table
-             WHERE user_id=%d AND claimed=1",
-            $user_id
-        )
-    );
-
-    // Show only earned coins history
-    $rows = $wpdb->get_results(
-        $wpdb->prepare(
-            "SELECT * FROM $table
-             WHERE user_id=%d AND claimed=1 AND coins > 0
-             ORDER BY id DESC",
-            $user_id
-        )
-    );
-
-    ob_start(); ?>
-    <div class="user-wallet">
-        <h2>Your Wallet</h2>
-        <p><strong>Total Coins:</strong> <?php echo esc_html($total_coins); ?></p>
-
-        <table class="widefat striped">
-            <thead>
-                <tr>
-                    <th>Video URL</th>
-                    <th>Coins</th>
-                    <th>Redirect Time</th>
-                    <th>Return Time</th>
-                </tr>
-            </thead>
-            <tbody>
-            <?php if ($rows): foreach ($rows as $row): ?>
-                <tr>
-                    <td style="word-break:break-all">
-                        <a href="<?php echo esc_url($row->video_url); ?>" target="_blank">
-                            <?php echo esc_html($row->video_url); ?>
-                        </a>
-                    </td>
-                    <td>+<?php echo esc_html($row->coins); ?></td>
-                    <td><?php echo esc_html($row->redirect_time); ?></td>
-                    <td><?php echo esc_html($row->return_time); ?></td>
-                </tr>
-            <?php endforeach; else: ?>
-                <tr><td colspan="4">No earned coins yet.</td></tr>
-            <?php endif; ?>
-            </tbody>
-        </table>
-    </div>
-    <?php
-    return ob_get_clean();
-});
-
-
-//---------------------- user uplode video --------------------------------------\\
-
-/* =====================================================
- * FRONTEND VIDEO UPLOAD (AJAX)
- * Shortcode: [frontend_video_upload_ajax]
- * ===================================================== */
-add_shortcode('frontend_video_upload', function () {
-
-    if (!is_user_logged_in()) {
-        return '<p>Please login to upload videos.</p>';
-    }
-
-    global $wpdb;
-    $user_id = get_current_user_id();
-
-    // Total claimed coins
-    $total_coins = (int) $wpdb->get_var(
-        $wpdb->prepare(
-            "SELECT SUM(coins) FROM {$wpdb->prefix}video_clicks
-             WHERE user_id=%d AND claimed=1 AND coins>0",
-            $user_id
-        )
-    );
-
-    // Approved plans
-    $plans = $wpdb->get_results(
-        $wpdb->prepare(
-            "SELECT * FROM {$wpdb->prefix}mv_payments
-             WHERE user_id=%d AND status='approved' AND plan>0",
-            $user_id
-        )
-    );
-
-    if ($total_coins < 10) {
-        return '<p style="color:red">❌ Minimum 10 coins required.</p>';
-    }
-
-    if (!$plans) {
-        return '<p style="color:red">❌ No active plan available.</p>';
-    }
-
+    $user_coins = bvt_get_user_coins($user_id);
+    $required_coins = 10;
+    
     ob_start();
     ?>
-    <div id="fv-result"></div>
-
-    <form id="fv-upload-form">
-        <?php wp_nonce_field('fv_ajax_nonce', 'fv_nonce'); ?>
-
-        <p>
-            <label><strong>Video URL</strong></label><br>
-            <input type="url" name="video_url" required style="width:100%">
-        </p>
-
-        <p>
-            <label><strong>Select Plan</strong></label><br>
-            <select name="plan_id" required style="width:100%">
-                <option value="">-- Select Plan --</option>
-                <?php foreach ($plans as $p): ?>
-                    <option value="<?php echo esc_attr($p->id); ?>">
-                        Plan <?php echo esc_html($p->plan); ?> (<?php echo esc_html($p->payment_method); ?>)
-                    </option>
-                <?php endforeach; ?>
-            </select>
-        </p>
-
-        <button type="submit" class="button button-primary">
-            Upload Video (10 Coins)
-        </button>
-    </form>
-
+    <div style="max-width: 600px; margin: 20px auto; padding: 20px; background: #f9f9f9; border-radius: 5px;">
+        <h2 style="margin-top: 0;">Upload Video URL</h2>
+        <div style="margin-bottom: 15px; padding: 10px; background: #e7f3ff; border-radius: 3px;">
+            <strong>Your Coins:</strong> <span style="color: #ff6b00; font-size: 18px;"><?php echo $user_coins; ?></span>
+            <br>
+            <small>Required: <?php echo $required_coins; ?> coins per video upload</small>
+        </div>
+        
+        <?php if ($user_coins >= $required_coins && $user_coins > 0) : ?>
+            <form id="bvt-upload-video-form">
+                <div style="margin-bottom: 15px;">
+                    <label for="video_url" style="display: block; margin-bottom: 5px; font-weight: bold;">Video URL:</label>
+                    <input type="url" id="video_url" name="video_url" required 
+                           placeholder="https://youtube.com/watch?v=..." 
+                           style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 3px; box-sizing: border-box;">
+                    <small style="color: #666;">Enter YouTube, Facebook, or Instagram video URL</small>
+                </div>
+                <button type="submit" class="button button-primary" style="width: 100%; padding: 12px; font-size: 16px;">
+                    Upload Video (Cost: <?php echo $required_coins; ?> Coins)
+                </button>
+                <div id="bvt-upload-message" style="margin-top: 15px;"></div>
+            </form>
+        <?php else : ?>
+            <div style="padding: 15px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 3px; text-align: center;">
+                <?php if ($user_coins == 0) : ?>
+                    <p style="margin: 0; font-weight: bold; color: #856404;">You have <strong>0 coins</strong>.</p>
+                    <p style="margin: 5px 0 0 0;">You need at least <strong><?php echo $required_coins; ?> coins</strong> to upload a video.</p>
+                    <p style="margin: 5px 0 0 0;">Watch videos and claim coins to earn more!</p>
+                <?php else : ?>
+                    <p style="margin: 0;">You need at least <strong><?php echo $required_coins; ?> coins</strong> to upload a video.</p>
+                    <p style="margin: 5px 0 0 0;">You currently have <strong><?php echo $user_coins; ?> coins</strong>.</p>
+                    <p style="margin: 5px 0 0 0;">Watch more videos and claim coins to earn more!</p>
+                <?php endif; ?>
+            </div>
+        <?php endif; ?>
+    </div>
+    
     <script>
-    document.getElementById('fv-upload-form').addEventListener('submit', function(e){
+    document.getElementById('bvt-upload-video-form')?.addEventListener('submit', function(e) {
         e.preventDefault();
-
-        let formData = new FormData(this);
-        formData.append('action', 'fv_ajax_upload');
-
-        fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+        const form = this;
+        const videoUrl = document.getElementById('video_url').value;
+        const messageDiv = document.getElementById('bvt-upload-message');
+        const submitBtn = form.querySelector('button[type="submit"]');
+        const userCoins = <?php echo $user_coins; ?>;
+        const requiredCoins = <?php echo $required_coins; ?>;
+        
+        // Client-side validation: Check if user has enough coins
+        if (userCoins < requiredCoins || userCoins <= 0) {
+            messageDiv.innerHTML = '<div style="color: red; padding: 10px; background: #ffe6e6; border-radius: 3px;">You do not have enough coins to upload videos. You need ' + requiredCoins + ' coins but you have ' + userCoins + ' coins.</div>';
+            return;
+        }
+        
+        if (!videoUrl) {
+            messageDiv.innerHTML = '<div style="color: red; padding: 10px; background: #ffe6e6; border-radius: 3px;">Please enter a video URL</div>';
+            return;
+        }
+        
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Uploading...';
+        messageDiv.innerHTML = '';
+        
+        fetch("<?php echo admin_url('admin-ajax.php'); ?>?action=bvt_upload_video", {
             method: 'POST',
-            body: formData
+            credentials: 'same-origin',
+            headers: {'Content-Type':'application/x-www-form-urlencoded'},
+            body: 'video_url=' + encodeURIComponent(videoUrl)
         })
-        .then(res => res.json())
-        .then(res => {
-            document.getElementById('fv-result').innerHTML =
-                '<p style="color:'+(res.success?'green':'red')+'">'+res.message+'</p>';
-
-            if(res.success){
-                document.getElementById('fv-upload-form').reset();
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                messageDiv.innerHTML = '<div style="color: green; padding: 10px; background: #e6ffe6; border-radius: 3px; font-weight: bold;">' + data.data.message + '</div>';
+                form.reset();
+                // Reload page after 2 seconds to update coin balance
+                setTimeout(function() {
+                    location.reload();
+                }, 2000);
+            } else {
+                messageDiv.innerHTML = '<div style="color: red; padding: 10px; background: #ffe6e6; border-radius: 3px;">' + data.data.message + '</div>';
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Upload Video (Cost: <?php echo $required_coins; ?> Coins)';
             }
+        })
+        .catch(error => {
+            messageDiv.innerHTML = '<div style="color: red; padding: 10px; background: #ffe6e6; border-radius: 3px;">Error uploading video. Please try again.</div>';
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Upload Video (Cost: <?php echo $required_coins; ?> Coins)';
         });
     });
     </script>
     <?php
-
+    
     return ob_get_clean();
 });
 
+/* =========================================
+ * AJAX HANDLER FOR FRONTEND VIDEO UPLOAD
+ * ========================================= */
+add_action('wp_ajax_bvt_upload_video', 'bvt_upload_video');
+add_action('wp_ajax_nopriv_bvt_upload_video', 'bvt_upload_video');
 
-/* =====================================================
- * AJAX VIDEO UPLOAD HANDLER
- * ===================================================== */
-add_action('wp_ajax_fv_ajax_upload', function () {
-
+function bvt_upload_video() {
+    // Security check: Must be logged in
     if (!is_user_logged_in()) {
-        wp_send_json(['success'=>false,'message'=>'Login required']);
+        wp_send_json_error(['message' => 'You must be logged in to upload videos']);
+        return;
     }
-
-    if (!wp_verify_nonce($_POST['fv_nonce'], 'fv_ajax_nonce')) {
-        wp_send_json(['success'=>false,'message'=>'Security check failed']);
+    
+    // Security check: Must provide video URL
+    if (!isset($_POST['video_url']) || empty($_POST['video_url'])) {
+        wp_send_json_error(['message' => 'Please provide a video URL']);
+        return;
     }
-
-    global $wpdb;
-    $user_id   = get_current_user_id();
+    
+    $user_id = get_current_user_id();
     $video_url = esc_url_raw($_POST['video_url']);
-    $plan_id   = intval($_POST['plan_id']);
-
-    if (!$video_url || !$plan_id) {
-        wp_send_json(['success'=>false,'message'=>'Invalid input']);
+    $required_coins = 10;
+    
+    // Validate URL format
+    if (!filter_var($video_url, FILTER_VALIDATE_URL)) {
+        wp_send_json_error(['message' => 'Invalid URL format']);
+        return;
     }
-
-    // Check coins
-   
-
-    if ($coins < 10) {
-        wp_send_json(['success'=>false,'message'=>'Not enough coins']);
+    
+    // CRITICAL: Check user has enough coins (must be >= 10, not just > 0)
+    $user_coins = bvt_get_user_coins($user_id);
+    
+    // Strict validation: User must have at least 10 coins
+    if ($user_coins < $required_coins) {
+        $message = "You don't have enough coins to upload videos. ";
+        if ($user_coins == 0) {
+            $message .= "You currently have 0 coins. ";
+        } else {
+            $message .= "You need {$required_coins} coins but you only have {$user_coins} coins. ";
+        }
+        $message .= "Watch videos and claim coins to earn more!";
+        wp_send_json_error(['message' => $message]);
+        return;
     }
-
-    // Validate plan
-    $plan = $wpdb->get_row(
-        $wpdb->prepare(
-            "SELECT * FROM {$wpdb->prefix}mv_payments
-             WHERE id=%d AND user_id=%d AND status='approved'",
-            $plan_id, $user_id
-        )
-    );
-
-    if (!$plan) {
-        wp_send_json(['success'=>false,'message'=>'Invalid plan']);
+    
+    // Double-check: Ensure coins are not negative or zero
+    if ($user_coins <= 0) {
+        wp_send_json_error(['message' => 'You have no coins. Please watch videos and claim coins first.']);
+        return;
     }
-
+    
     // Insert video
-    $post_id = wp_insert_post([
+    $result = wp_insert_post([
         'post_type'   => 'video_link',
         'post_title'  => $video_url,
         'post_status' => 'publish',
-        'meta_input'  => ['_video_url'=>$video_url]
+        'meta_input'  => [
+            '_video_url' => $video_url,
+            '_uploaded_by' => $user_id,
+        ],
     ]);
+    
+    if (is_wp_error($result)) {
+        wp_send_json_error(['message' => 'Failed to upload video. Please try again.']);
+        return;
+    }
+    
+    // Final check before deducting: Re-verify user still has enough coins (prevent race conditions)
+    global $wpdb;
+    $coins_table = $wpdb->prefix . 'user_claim_coins';
+    $current_balance = bvt_get_user_coins($user_id);
+    
+    if ($current_balance < $required_coins) {
+        // Rollback: delete the video if user doesn't have enough coins
+        wp_delete_post($result, true);
+        wp_send_json_error(['message' => "Insufficient coins. Your balance changed. You need {$required_coins} coins but you have {$current_balance}."]);
+        return;
+    }
+    
+    // Deduct coins
+    $deduction_result = $wpdb->insert($coins_table, [
+        'user_id' => $user_id,
+        'click_id' => null,
+        'coins_amount' => -$required_coins, // Negative amount for deduction
+        'claimed_at' => current_time('mysql'),
+        'transaction_type' => 'video_upload',
+        'video_upload_id' => $result
+    ], [
+        '%d', '%d', '%d', '%s', '%s', '%d'
+    ]);
+    
+    if ($deduction_result === false) {
+        // Rollback: delete the video if coin deduction fails
+        wp_delete_post($result, true);
+        wp_send_json_error(['message' => 'Failed to process payment. Video not uploaded.']);
+        return;
+    }
+    
+    $new_balance = bvt_get_user_coins($user_id);
+    
+    wp_send_json_success([
+        'message' => "Video uploaded successfully! {$required_coins} coins deducted. Your new balance: {$new_balance} coins.",
+        'new_balance' => $new_balance,
+        'video_id' => $result
+    ]);
+}
 
-    if (!$post_id) {
-        wp_send_json(['success'=>false,'message'=>'Upload failed']);
+/* =========================================
+ * AJAX HANDLER FOR REDIRECT TRACKING
+ * ========================================= */
+add_action('wp_ajax_bvt_track_redirect', 'bvt_track_redirect');
+add_action('wp_ajax_nopriv_bvt_track_redirect', 'bvt_track_redirect');
+
+function bvt_track_redirect() {
+    // Verify nonce for security
+    if (!isset($_POST['video_id'])) {
+        wp_send_json_error(['message' => 'Missing video ID']);
+        return;
+    }
+    
+    global $wpdb;
+    $video_id = intval($_POST['video_id']);
+    
+    if ($video_id <= 0) {
+        wp_send_json_error(['message' => 'Invalid video ID']);
+        return;
+    }
+    
+    $user_id = get_current_user_id();
+    $video_url = get_post_meta($video_id, '_video_url', true);
+    
+    if (empty($video_url)) {
+        wp_send_json_error(['message' => 'Video not found']);
+        return;
+    }
+    
+    // Get IP address (handle proxy headers)
+    $ip = '';
+    if (!empty($_SERVER['HTTP_CLIENT_IP'])) {
+        $ip = sanitize_text_field($_SERVER['HTTP_CLIENT_IP']);
+    } elseif (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        $ip = sanitize_text_field($_SERVER['HTTP_X_FORWARDED_FOR']);
+    } else {
+        $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : '';
     }
 
-    // Deduct 10 coins
-    $wpdb->insert(
-        "{$wpdb->prefix}video_clicks",
-        [
-            'user_id'   => $user_id,
-            'video_id'  => $post_id,
-            'video_url' => $video_url,
-            'coins'     => -10,
-            'claimed'   => 1,
-            'redirect_time'=> current_time('mysql')
-        ]
-    );
-
-    // Remove plan
-    $wpdb->update(
-        "{$wpdb->prefix}mv_payments",
-        ['status'=>'used'],
-        ['id'=>$plan_id]
-    );
-
-    wp_send_json([
-        'success'=>true,
-        'message'=>'✅ Video uploaded! 10 coins deducted & plan used.'
+    $result = $wpdb->insert($wpdb->prefix.'video_clicks', [
+        'user_id' => $user_id ? $user_id : null,
+        'video_id' => $video_id,
+        'video_url' => $video_url,
+        'redirect_time' => current_time('mysql'),
+        'ip_address' => $ip
+    ], [
+        '%d', '%d', '%s', '%s', '%s'
     ]);
-});
+
+    if ($result === false) {
+        wp_send_json_error(['message' => 'Failed to track click']);
+    } else {
+        wp_send_json_success(['message' => 'Click tracked']);
+    }
+}
+
+/* =========================================
+ * AJAX HANDLER FOR CLAIMING COINS
+ * ========================================= */
+add_action('wp_ajax_bvt_claim_coins', 'bvt_claim_coins');
+add_action('wp_ajax_nopriv_bvt_claim_coins', 'bvt_claim_coins');
+
+function bvt_claim_coins() {
+    if (!is_user_logged_in()) {
+        wp_send_json_error(['message' => 'You must be logged in to claim coins']);
+        return;
+    }
+    
+    $user_id = get_current_user_id();
+    global $wpdb;
+    $table = $wpdb->prefix . 'video_clicks';
+    $coins_table = $wpdb->prefix . 'user_claim_coins';
+    
+    // Get all eligible but not claimed clicks for this user (within 24 hours)
+    $eligible_clicks = $wpdb->get_results($wpdb->prepare(
+        "SELECT id, video_id, video_url 
+         FROM $table 
+         WHERE user_id = %d 
+         AND coins_eligible = 1 
+         AND coins_claimed = 0
+         AND coins_eligible_at IS NOT NULL
+         AND coins_eligible_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)",
+        $user_id
+    ));
+    
+    if (empty($eligible_clicks)) {
+        wp_send_json_error(['message' => 'No coins available to claim. The 24-hour claim window has expired.']);
+        return;
+    }
+    
+    $total_coins = 0;
+    $claimed_count = 0;
+    
+    // Process each eligible click
+    foreach ($eligible_clicks as $click) {
+        // Default: 1 coin per video (you can customize this)
+        $coins_amount = 1;
+        
+        // Insert into claim coins table
+        $result = $wpdb->insert($coins_table, [
+            'user_id' => $user_id,
+            'click_id' => $click->id,
+            'coins_amount' => $coins_amount,
+            'claimed_at' => current_time('mysql'),
+            'transaction_type' => 'claim'
+        ], [
+            '%d', '%d', '%d', '%s', '%s'
+        ]);
+        
+        if ($result !== false) {
+            // Mark as claimed in video_clicks table
+            $wpdb->update(
+                $table,
+                ['coins_claimed' => 1],
+                ['id' => $click->id],
+                ['%d'],
+                ['%d']
+            );
+            
+            $total_coins += $coins_amount;
+            $claimed_count++;
+        }
+    }
+    
+    // Get new total balance
+    $new_balance = bvt_get_user_coins($user_id);
+    
+    wp_send_json_success([
+        'message' => "Successfully claimed {$total_coins} coin(s) from {$claimed_count} video(s)!",
+        'coins_claimed' => $total_coins,
+        'new_balance' => $new_balance
+    ]);
+}
+
+/* =========================================
+ * TRACK USER RETURN (Improved Logic)
+ * ========================================= */
+add_action('wp', function() {
+    // Only track return if user came from external site (check referrer)
+    $referrer = isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : '';
+    $current_domain = parse_url(home_url(), PHP_URL_HOST);
+    $referrer_domain = $referrer ? parse_url($referrer, PHP_URL_HOST) : '';
+    
+    // If referrer is from external domain or user is logged in, check for pending returns
+    if ($referrer_domain && $referrer_domain !== $current_domain) {
+        global $wpdb;
+        $table = $wpdb->prefix.'video_clicks';
+        $user_id = get_current_user_id();
+        
+        // For logged-in users, match by user_id
+        if ($user_id > 0) {
+            $record = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM $table WHERE user_id=%d AND return_time IS NULL ORDER BY id DESC LIMIT 1",
+                $user_id
+            ));
+        } else {
+            // For guests, match by IP address and recent redirect (within last hour)
+            $ip = '';
+            if (!empty($_SERVER['HTTP_CLIENT_IP'])) {
+                $ip = sanitize_text_field($_SERVER['HTTP_CLIENT_IP']);
+            } elseif (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+                $ip = sanitize_text_field($_SERVER['HTTP_X_FORWARDED_FOR']);
+            } else {
+                $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : '';
+            }
+            
+            if ($ip) {
+                $record = $wpdb->get_row($wpdb->prepare(
+                    "SELECT * FROM $table 
+                     WHERE user_id IS NULL 
+                     AND ip_address=%s 
+                     AND return_time IS NULL 
+                     AND redirect_time >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+                     ORDER BY id DESC LIMIT 1",
+                    $ip
+                ));
+            } else {
+                $record = null;
+            }
+        }
+        
+        if ($record) {
+            $return_time = current_time('mysql');
+            $wpdb->update(
+                $table,
+                ['return_time' => $return_time],
+                ['id' => $record->id],
+                ['%s'],
+                ['%d']
+            );
+            
+            // Check if user is eligible for coins (only for logged-in users)
+            if ($user_id > 0 && $record->redirect_time) {
+                $redirect_date = date('Y-m-d', strtotime($record->redirect_time));
+                $return_date = date('Y-m-d', strtotime($return_time));
+                
+                // Check if same date and time difference > 2 minutes
+                if ($redirect_date === $return_date) {
+                    $time_diff = (strtotime($return_time) - strtotime($record->redirect_time)) / 60; // in minutes
+                    
+                    if ($time_diff > 2) {
+                        // Mark as eligible for coins and set eligibility timestamp
+                        $wpdb->update(
+                            $table,
+                            [
+                                'coins_eligible' => 1,
+                                'coins_eligible_at' => current_time('mysql')
+                            ],
+                            ['id' => $record->id],
+                            ['%d', '%s'],
+                            ['%d']
+                        );
+                    }
+                }
+            }
+        }
+    }
+});    
