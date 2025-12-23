@@ -1128,7 +1128,7 @@ function checkAndSendReturn() {
     .then(data => {
         if (data.success) {
             if (data.data.coin_awarded) {
-                alert('🎉 Great! You earned 1 coin for watching the video!');
+                alert('🎉 Great! You earned 10 coin for watching the video!');
             }
             // Clean up
             currentReturnToken = null;
