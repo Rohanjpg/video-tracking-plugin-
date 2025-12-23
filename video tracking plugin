@@ -1247,8 +1247,13 @@ document.querySelectorAll('.video-card').forEach(function(card) {
     return ob_get_clean();
 });
 
+
 /* =========================================
- * FRONTEND VIDEO UPLOAD SHORTCODE
+ * FRONTEND VIDEO UPLOAD SHORTCODE - WITH PLAN SELECTION DROPDOWN
+ * ========================================= */
+
+/* =========================================
+ * FRONTEND VIDEO UPLOAD SHORTCODE - WITH PLAN SELECTION DROPDOWN
  * ========================================= */
 add_shortcode('upload_video', function () {
     if (!is_user_logged_in()) {
@@ -1256,105 +1261,189 @@ add_shortcode('upload_video', function () {
                     <p>Please <a href="' . wp_login_url(get_permalink()) . '">login</a> to upload videos.</p>
                 </div>';
     }
-    
+
+    global $wpdb;
     $user_id = get_current_user_id();
     $user_coins = bvt_get_user_coins($user_id);
-    $required_coins = 10;
-    
+
+    // Get ALL distinct active plans for this user
+    $payment_table = $wpdb->prefix . 'mv_payments';
+    $plans = $wpdb->get_col($wpdb->prepare(
+        "SELECT DISTINCT TRIM(plan) FROM `$payment_table`
+         WHERE user_id = %d
+         AND (status = 'approved' OR status = 'used')
+         ORDER BY id DESC",
+        $user_id
+    ));
+
+    // Normalize plan values
+    $available_plans = [];
+    foreach ($plans as $p) {
+        $plan = trim($p);
+        if ($plan !== '') {
+            $available_plans[$plan] = true;
+        }
+    }
+
+    // Default: highest benefit first
+    $default_plan = '0'; // fallback
+    if (isset($available_plans['99'])) {
+        $default_plan = '99';
+    } elseif (isset($available_plans['10']) || isset($available_plans['1'])) {
+        $default_plan = isset($available_plans['10']) ? '10' : '1';
+    }
+
     ob_start();
     ?>
-    <div style="max-width: 600px; margin: 20px auto; padding: 20px; background: #f9f9f9; border-radius: 5px;">
-        <h2 style="margin-top: 0;">Upload Video URL</h2>
-        <div style="margin-bottom: 15px; padding: 10px; background: #e7f3ff; border-radius: 3px;">
-            <strong>Your Coins:</strong> <span style="color: #ff6b00; font-size: 18px;"><?php echo $user_coins; ?></span>
+    <div style="max-width: 600px; margin: 20px auto; padding: 20px; background: #f9f9f9; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+        <h2 style="margin-top: 0; text-align: center;">Upload Video URL</h2>
+
+        <div style="margin-bottom: 20px; padding: 15px; background: #e7f3ff; border-radius: 6px; text-align: center;">
+            <strong style="font-size: 18px;">Your Coins: <span style="color: #ff6b00; font-size: 22px;"><?php echo $user_coins; ?></span></strong>
             <br>
-            <small>Required: <?php echo $required_coins; ?> coins per video upload</small>
+            <?php if (!empty($available_plans)): ?>
+                <small><strong>Active Plans:</strong> <?php echo implode(', ', array_keys($available_plans)); ?></small>
+            <?php else: ?>
+                <small>No active plan</small>
+            <?php endif; ?>
         </div>
-        
-        <?php if ($user_coins >= $required_coins && $user_coins > 0) : ?>
+
+        <?php if (!empty($available_plans)): ?>
             <form id="bvt-upload-video-form">
                 <div style="margin-bottom: 15px;">
-                    <label for="video_url" style="display: block; margin-bottom: 5px; font-weight: bold;">Video URL:</label>
-                    <input type="url" id="video_url" name="video_url" required 
-                           placeholder="https://youtube.com/watch?v=..." 
-                           style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 3px; box-sizing: border-box;">
-                    <small style="color: #666;">Enter YouTube, Facebook, or Instagram video URL</small>
+                    <label for="selected_plan" style="display: block; margin-bottom: 8px; font-weight: bold;">Select Plan for This Upload:</label>
+                    <select name="selected_plan" id="selected_plan" style="width: 100%;  border: 1px solid #ccc; border-radius: 4px; font-size: 16px;">
+                        <?php foreach ($available_plans as $plan => $dummy): ?>
+                            <?php
+                            if ($plan === '99') {
+                                $cost = 0;
+                                $label = "Plan 99 → FREE Upload (Unlimited)";
+                            } elseif (in_array($plan, ['1', '10'])) {
+                                $cost = 10;
+                                $label = "Plan {$plan} → Cost: 10 coins";
+                            } else {
+                                $cost = 20;
+                                $label = "Plan {$plan} (Free/Default) → Cost: 20 coins";
+                            }
+                            ?>
+                            <option value="<?php echo esc_attr($plan); ?>" <?php selected($plan === $default_plan); ?> data-cost="<?php echo $cost; ?>">
+                                <?php echo $label; ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
                 </div>
-                <button type="submit" class="button button-primary" style="width: 100%; padding: 12px; font-size: 16px;">
-                    Upload Video (Cost: <?php echo $required_coins; ?> Coins)
-                </button>
+
+                <div style="margin-bottom: 10px; padding: 10px; background: #f0f8ff; border-radius: 4px; font-size: 15px; text-align: center;" id="plan-cost-info">
+                    <?php
+                    $default_cost = ($default_plan === '99') ? 0 : (in_array($default_plan, ['1','10']) ? 10 : 20);
+                    ?>
+                    Required for selected plan: <strong><?php echo $default_cost; ?> coins</strong>
+                </div>
+
+                <?php if ($user_coins >= $default_cost || $default_cost == 0): ?>
+                    <div style="margin-bottom: 15px;">
+                        <label for="video_url" style="display: block; margin-bottom: 8px; font-weight: bold;">Video URL:</label>
+                        <input type="url" id="video_url" name="video_url" required placeholder="https://youtube.com/watch?v=..."
+                               style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-size: 16px;">
+                        <small style="color: #666; display: block; margin-top: 5px;">YouTube, Facebook, or Instagram video link</small>
+                    </div>
+
+                    <button type="submit" class="button button-primary" style="width: 100%; padding: 14px; font-size: 18px;">
+                        Upload Video
+                    </button>
+                <?php else: ?>
+                    <div style="padding: 20px; background: #ffebee; border: 1px solid #f44336; border-radius: 6px; text-align: center; color: #c62828;">
+                        <strong>Insufficient Coins</strong><br>
+                        Selected plan requires <strong><?php echo $default_cost; ?> coins</strong>, but you have only <?php echo $user_coins; ?>.<br><br>
+                        Watch videos to earn more coins!
+                    </div>
+                <?php endif; ?>
+
                 <div id="bvt-upload-message" style="margin-top: 15px;"></div>
             </form>
-        <?php else : ?>
-            <div style="padding: 15px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 3px; text-align: center;">
-                <?php if ($user_coins == 0) : ?>
-                    <p style="margin: 0; font-weight: bold; color: #856404;">You have <strong>0 coins</strong>.</p>
-                    <p style="margin: 5px 0 0 0;">You need at least <strong><?php echo $required_coins; ?> coins</strong> to upload a video.</p>
-                    <p style="margin: 5px 0 0 0;">Watch videos and claim coins to earn more!</p>
-                <?php else : ?>
-                    <p style="margin: 0;">You need at least <strong><?php echo $required_coins; ?> coins</strong> to upload a video.</p>
-                    <p style="margin: 5px 0 0 0;">You currently have <strong><?php echo $user_coins; ?> coins</strong>.</p>
-                    <p style="margin: 5px 0 0 0;">Watch more videos and claim coins to earn more!</p>
+        <?php else: ?>
+            <!-- No plans at all -->
+            <div style="padding: 20px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 6px; text-align: center;">
+                <p><strong>You have no active plan.</strong></p>
+                <p>Default cost: <strong>20 coins</strong> per upload</p>
+                <?php if ($user_coins >= 20): ?>
+                    <p style="color: green;">You have enough coins! You can upload now.</p>
+                    <!-- Show form with hidden plan = none -->
+                    <form id="bvt-upload-video-form">
+                        <input type="hidden" name="selected_plan" value="none">
+                        <div style="margin: 15px 0;">
+                            <label><strong>Video URL:</strong></label>
+                            <input type="url" id="video_url" name="video_url" required placeholder="https://youtube.com/watch?v=..." style="width:100%; padding:12px; margin-top:8px;">
+                        </div>
+                        <button type="submit" class="button button-primary" style="width:100%; padding:14px; font-size:18px;">
+                            Upload Video (Cost: 20 Coins)
+                        </button>
+                        <div id="bvt-upload-message" style="margin-top:15px;"></div>
+                    </form>
+                <?php else: ?>
+                    <p>You need <strong>20 coins</strong> to upload. You have <?php echo $user_coins; ?>.</p>
+                    <p>Watch videos to earn coins!</p>
                 <?php endif; ?>
             </div>
         <?php endif; ?>
     </div>
-    
+
     <script>
+    // Update cost info when plan changes
+    document.getElementById('selected_plan')?.addEventListener('change', function() {
+        const selected = this.options[this.selectedIndex];
+        const cost = selected.dataset.cost;
+        document.getElementById('plan-cost-info').innerHTML = 
+            'Required for selected plan: <strong>' + cost + ' coins</strong>';
+    });
+
+    // Form submit
     document.getElementById('bvt-upload-video-form')?.addEventListener('submit', function(e) {
         e.preventDefault();
         const form = this;
-        const videoUrl = document.getElementById('video_url').value;
+        const videoUrl = document.getElementById('video_url')?.value.trim();
+        const selectedPlan = document.querySelector('[name="selected_plan"]').value;
         const messageDiv = document.getElementById('bvt-upload-message');
         const submitBtn = form.querySelector('button[type="submit"]');
-        const userCoins = <?php echo $user_coins; ?>;
-        const requiredCoins = <?php echo $required_coins; ?>;
-        
-        // Client-side validation: Check if user has enough coins
-        if (userCoins < requiredCoins || userCoins <= 0) {
-            messageDiv.innerHTML = '<div style="color: red; padding: 10px; background: #ffe6e6; border-radius: 3px;">You do not have enough coins to upload videos. You need ' + requiredCoins + ' coins but you have ' + userCoins + ' coins.</div>';
-            return;
-        }
-        
+
         if (!videoUrl) {
-            messageDiv.innerHTML = '<div style="color: red; padding: 10px; background: #ffe6e6; border-radius: 3px;">Please enter a video URL</div>';
+            messageDiv.innerHTML = '<div style="color: red; padding: 12px; background: #ffe6e6; border-radius: 4px;">Please enter a video URL</div>';
             return;
         }
-        
+
         submitBtn.disabled = true;
         submitBtn.textContent = 'Uploading...';
-        messageDiv.innerHTML = '';
-        
-        fetch("<?php echo admin_url('admin-ajax.php'); ?>?action=bvt_upload_video", {
+
+        const formData = new FormData();
+        formData.append('action', 'bvt_upload_video');
+        formData.append('video_url', videoUrl);
+        formData.append('selected_plan', selectedPlan);
+
+        fetch("<?php echo admin_url('admin-ajax.php'); ?>", {
             method: 'POST',
             credentials: 'same-origin',
-            headers: {'Content-Type':'application/x-www-form-urlencoded'},
-            body: 'video_url=' + encodeURIComponent(videoUrl)
+            body: formData
         })
-        .then(response => response.json())
+        .then(r => r.json())
         .then(data => {
             if (data.success) {
-                messageDiv.innerHTML = '<div style="color: green; padding: 10px; background: #e6ffe6; border-radius: 3px; font-weight: bold;">' + data.data.message + '</div>';
+                messageDiv.innerHTML = '<div style="color: green; padding: 12px; background: #e6ffe6; border-radius: 4px; font-weight: bold;">' + data.data.message + '</div>';
                 form.reset();
-                // Reload page after 2 seconds to update coin balance
-                setTimeout(function() {
-                    location.reload();
-                }, 2000);
+                setTimeout(() => location.reload(), 2000);
             } else {
-                messageDiv.innerHTML = '<div style="color: red; padding: 10px; background: #ffe6e6; border-radius: 3px;">' + data.data.message + '</div>';
+                messageDiv.innerHTML = '<div style="color: red; padding: 12px; background: #ffe6e6; border-radius: 4px;">' + data.data.message + '</div>';
                 submitBtn.disabled = false;
-                submitBtn.textContent = 'Upload Video (Cost: <?php echo $required_coins; ?> Coins)';
+                submitBtn.textContent = 'Upload Video';
             }
         })
-        .catch(error => {
-            messageDiv.innerHTML = '<div style="color: red; padding: 10px; background: #ffe6e6; border-radius: 3px;">Error uploading video. Please try again.</div>';
+        .catch(() => {
+            messageDiv.innerHTML = '<div style="color: red; padding: 12px; background: #ffe6e6; border-radius: 4px;">Upload failed. Try again.</div>';
             submitBtn.disabled = false;
-            submitBtn.textContent = 'Upload Video (Cost: <?php echo $required_coins; ?> Coins)';
+            submitBtn.textContent = 'Upload Video';
         });
     });
     </script>
     <?php
-    
     return ob_get_clean();
 });
 
@@ -1365,109 +1454,87 @@ add_action('wp_ajax_bvt_upload_video', 'bvt_upload_video');
 add_action('wp_ajax_nopriv_bvt_upload_video', 'bvt_upload_video');
 
 function bvt_upload_video() {
-    // Security check: Must be logged in
     if (!is_user_logged_in()) {
         wp_send_json_error(['message' => 'You must be logged in to upload videos']);
         return;
     }
-    
-    // Security check: Must provide video URL
-    if (!isset($_POST['video_url']) || empty($_POST['video_url'])) {
+
+    if (empty($_POST['video_url'])) {
         wp_send_json_error(['message' => 'Please provide a video URL']);
         return;
     }
-    
+
+    global $wpdb;
     $user_id = get_current_user_id();
     $video_url = esc_url_raw($_POST['video_url']);
-    $required_coins = 10;
-    
-    // Validate URL format
+    $selected_plan = isset($_POST['selected_plan']) ? trim($_POST['selected_plan']) : 'none';
+
     if (!filter_var($video_url, FILTER_VALIDATE_URL)) {
         wp_send_json_error(['message' => 'Invalid URL format']);
         return;
     }
-    
-    // CRITICAL: Check user has enough coins (must be >= 10, not just > 0)
+
+    // Calculate cost based on selected plan
+    $required_coins = 20;
+    if ($selected_plan === '99') {
+        $required_coins = 0;
+    } elseif (in_array($selected_plan, ['1', '10'])) {
+        $required_coins = 10;
+    } elseif ($selected_plan === 'none') {
+        $required_coins = 20;
+    }
+
     $user_coins = bvt_get_user_coins($user_id);
-    
-    // Strict validation: User must have at least 10 coins
-    if ($user_coins < $required_coins) {
-        $message = "You don't have enough coins to upload videos. ";
-        if ($user_coins == 0) {
-            $message .= "You currently have 0 coins. ";
-        } else {
-            $message .= "You need {$required_coins} coins but you only have {$user_coins} coins. ";
-        }
-        $message .= "Watch videos and claim coins to earn more!";
-        wp_send_json_error(['message' => $message]);
+
+    if ($required_coins > 0 && $user_coins < $required_coins) {
+        wp_send_json_error(['message' => "Not enough coins. This plan requires {$required_coins} coins (you have {$user_coins})."]);
         return;
     }
-    
-    // Double-check: Ensure coins are not negative or zero
-    if ($user_coins <= 0) {
-        wp_send_json_error(['message' => 'You have no coins. Please watch videos and claim coins first.']);
-        return;
-    }
-    
+
     // Insert video
     $result = wp_insert_post([
-        'post_type'   => 'video_link',
-        'post_title'  => $video_url,
+        'post_type' => 'video_link',
+        'post_title' => $video_url,
         'post_status' => 'publish',
-        'meta_input'  => [
+        'meta_input' => [
             '_video_url' => $video_url,
             '_uploaded_by' => $user_id,
         ],
     ]);
-    
+
     if (is_wp_error($result)) {
-        wp_send_json_error(['message' => 'Failed to upload video. Please try again.']);
+        wp_send_json_error(['message' => 'Failed to save video. Try again.']);
         return;
     }
-    
-    // Final check before deducting: Re-verify user still has enough coins (prevent race conditions)
-    global $wpdb;
-    $coins_table = $wpdb->prefix . 'user_claim_coins';
-    $current_balance = bvt_get_user_coins($user_id);
-    
-    if ($current_balance < $required_coins) {
-        // Rollback: delete the video if user doesn't have enough coins
-        wp_delete_post($result, true);
-        wp_send_json_error(['message' => "Insufficient coins. Your balance changed. You need {$required_coins} coins but you have {$current_balance}."]);
-        return;
+
+    // Deduct coins if required
+    if ($required_coins > 0) {
+        $coins_table = $wpdb->prefix . 'user_claim_coins';
+        $deduct = $wpdb->insert($coins_table, [
+            'user_id' => $user_id,
+            'coins_amount' => -$required_coins,
+            'claimed_at' => current_time('mysql'),
+            'transaction_type' => 'video_upload',
+            'video_upload_id' => $result
+        ]);
+
+        if ($deduct === false) {
+            wp_delete_post($result, true);
+            wp_send_json_error(['message' => 'Failed to deduct coins. Upload cancelled.']);
+            return;
+        }
     }
-    
-    // Deduct coins
-    $deduction_result = $wpdb->insert($coins_table, [
-        'user_id' => $user_id,
-        'click_id' => null,
-        'coins_amount' => -$required_coins, // Negative amount for deduction
-        'claimed_at' => current_time('mysql'),
-        'transaction_type' => 'video_upload',
-        'video_upload_id' => $result
-    ], [
-        '%d', '%d', '%d', '%s', '%s', '%d'
-    ]);
-    
-    if ($deduction_result === false) {
-        // Rollback: delete the video if coin deduction fails
-        wp_delete_post($result, true);
-        wp_send_json_error(['message' => 'Failed to process payment. Video not uploaded.']);
-        return;
-    }
-    
+
     $new_balance = bvt_get_user_coins($user_id);
-    
+    $plan_name = ($required_coins == 0) ? '99 (Free)' : ($selected_plan === 'none' ? 'No Plan' : $selected_plan);
+
     wp_send_json_success([
-        'message' => "Video uploaded successfully! {$required_coins} coins deducted. Your new balance: {$new_balance} coins.",
-        'new_balance' => $new_balance,
-        'video_id' => $result
+        'message' => "Video uploaded successfully using Plan {$plan_name}! New balance: {$new_balance} coins.",
+        'new_balance' => $new_balance
     ]);
 }
 
-/* =========================================
- * AJAX HANDLER FOR REDIRECT TRACKING
- * ========================================= */
+
 /* =========================================
  * AJAX HANDLER FOR REDIRECT TRACKING
  * ========================================= */
