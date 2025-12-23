@@ -109,8 +109,17 @@ function bvt_get_user_coins($user_id) {
 /* =========================================
  * HELPER FUNCTION: GET VIDEO THUMBNAIL
  * ========================================= */
-function bvt_get_video_thumbnail($url) {
+function bvt_get_video_thumbnail($url, $video_id = null) {
+    // Check if thumbnail is cached in post meta
+    if ($video_id) {
+        $cached_thumbnail = get_post_meta($video_id, '_video_thumbnail', true);
+        if (!empty($cached_thumbnail)) {
+            return $cached_thumbnail;
+        }
+    }
+    
     $thumbnail = '';
+    
     // Get YouTube thumbnail
     if (strpos($url, 'youtube.com') !== false || strpos($url, 'youtu.be') !== false) {
         preg_match("#(?<=v=|youtu.be/)[a-zA-Z0-9_-]+#", $url, $matches);
@@ -118,8 +127,59 @@ function bvt_get_video_thumbnail($url) {
             $thumbnail = 'https://img.youtube.com/vi/'.$matches[0].'/hqdefault.jpg';
         }
     }
-    // For simplicity, Facebook/Instagram placeholders
-    if (!$thumbnail) $thumbnail = 'https://via.placeholder.com/480x270?text=Video';
+    // Get Facebook video thumbnail
+    elseif (strpos($url, 'facebook.com') !== false || strpos($url, 'fb.com') !== false || strpos($url, 'fb.watch') !== false) {
+        // Try to extract video ID from Facebook URL
+        // Facebook video URLs can be: https://www.facebook.com/watch/?v=VIDEO_ID
+        // or https://www.facebook.com/USERNAME/videos/VIDEO_ID/
+        // or https://fb.watch/VIDEO_ID/
+        $video_id_fb = null;
+        if (preg_match('#(?:v=|videos/|watch/)(\d+)#', $url, $matches)) {
+            $video_id_fb = $matches[1];
+        } elseif (preg_match('#fb\.watch/([a-zA-Z0-9_-]+)#', $url, $matches)) {
+            $video_id_fb = $matches[1];
+        }
+        
+        if ($video_id_fb) {
+            // Use Facebook oEmbed API
+            $oembed_url = 'https://www.facebook.com/plugins/video/oembed.json?url=' . urlencode($url);
+            $response = wp_remote_get($oembed_url, ['timeout' => 5]);
+            if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 200) {
+                $body = json_decode(wp_remote_retrieve_body($response), true);
+                if (isset($body['thumbnail_url'])) {
+                    $thumbnail = $body['thumbnail_url'];
+                }
+            }
+            // Fallback: Try Graph API picture endpoint (may not work without token)
+            if (!$thumbnail && is_numeric($video_id_fb)) {
+                $thumbnail = 'https://graph.facebook.com/' . $video_id_fb . '/picture';
+            }
+        }
+    }
+    // Get Instagram video thumbnail
+    elseif (strpos($url, 'instagram.com') !== false) {
+        // Instagram URLs: https://www.instagram.com/p/POST_ID/ or https://www.instagram.com/reel/REEL_ID/
+        // Use Instagram oEmbed API
+        $oembed_url = 'https://api.instagram.com/oembed?url=' . urlencode($url);
+        $response = wp_remote_get($oembed_url, ['timeout' => 5]);
+        if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 200) {
+            $body = json_decode(wp_remote_retrieve_body($response), true);
+            if (isset($body['thumbnail_url'])) {
+                $thumbnail = $body['thumbnail_url'];
+            }
+        }
+    }
+    
+    // Fallback placeholder if no thumbnail found
+    if (!$thumbnail) {
+        $thumbnail = 'https://via.placeholder.com/480x270?text=Video';
+    }
+    
+    // Cache the thumbnail in post meta if video_id is provided
+    if ($video_id && $thumbnail) {
+        update_post_meta($video_id, '_video_thumbnail', $thumbnail);
+    }
+    
     return $thumbnail;
 }
 
@@ -175,6 +235,16 @@ add_action('admin_menu', function () {
         'manage_options',
         'bvt-tracking-stats',
         'bvt_tracking_stats_page'
+    );
+    
+    // Sub-menu: Shortcodes
+    add_submenu_page(
+        'bulk-video-upload',
+        'Shortcodes',
+        'Shortcodes',
+        'manage_options',
+        'bvt-shortcodes',
+        'bvt_shortcodes_page'
     );
 });
 
@@ -281,6 +351,7 @@ function bvt_video_management_page() {
     
     $query = new WP_Query($query_args);
     $table = $wpdb->prefix . 'video_clicks';
+    $coins_table = $wpdb->prefix . 'user_claim_coins';
     
     ?>
     <div class="wrap">
@@ -321,6 +392,7 @@ function bvt_video_management_page() {
                     <th>Uploaded By</th>
                     <th>Date Added</th>
                     <th>Total Clicks</th>
+                    <th>Coins Claimed</th>
                     <th>Status</th>
                     <th>Actions</th>
                 </tr>
@@ -339,6 +411,16 @@ function bvt_video_management_page() {
                             $video_id
                         ));
                         
+                        // Get coins claimed count for this video
+                        $coins_claimed_count = $wpdb->get_var($wpdb->prepare(
+                            "SELECT COUNT(*) 
+                             FROM $coins_table ucc
+                             INNER JOIN $table vc ON ucc.click_id = vc.id
+                             WHERE vc.video_id = %d 
+                             AND ucc.transaction_type = 'claim'",
+                            $video_id
+                        ));
+                        
                         // Get uploader name
                         if ($uploaded_by) {
                             $uploader = get_userdata($uploaded_by);
@@ -353,6 +435,7 @@ function bvt_video_management_page() {
                             <td><?php echo esc_html($uploader_name); ?></td>
                             <td><?php echo get_the_date('Y-m-d H:i:s'); ?></td>
                             <td><strong><?php echo intval($click_count); ?></strong></td>
+                            <td><strong style="color: #ff6b00;"><?php echo intval($coins_claimed_count); ?></strong></td>
                             <td>
                                 <?php if ($is_hidden) : ?>
                                     <span style="color: red; font-weight: bold;">Hidden</span>
@@ -376,7 +459,7 @@ function bvt_video_management_page() {
                     <?php endwhile; ?>
                 <?php else : ?>
                     <tr>
-                        <td colspan="7">No videos found.</td>
+                        <td colspan="8">No videos found.</td>
                     </tr>
                 <?php endif; ?>
             </tbody>
@@ -413,6 +496,9 @@ function bvt_all_videos_page() {
         'order' => 'DESC',
     ]);
     
+    $table = $wpdb->prefix . 'video_clicks';
+    $coins_table = $wpdb->prefix . 'user_claim_coins';
+    
     ?>
     <div class="wrap">
         <h1>All Videos</h1>
@@ -423,6 +509,7 @@ function bvt_all_videos_page() {
                     <th>Video URL</th>
                     <th>Date Added</th>
                     <th>Total Clicks</th>
+                    <th>Coins Claimed</th>
                     <th>Actions</th>
                 </tr>
             </thead>
@@ -432,7 +519,17 @@ function bvt_all_videos_page() {
                         $video_id = get_the_ID();
                         $video_url = get_post_meta($video_id, '_video_url', true);
                         $click_count = $wpdb->get_var($wpdb->prepare(
-                            "SELECT COUNT(*) FROM {$wpdb->prefix}video_clicks WHERE video_id = %d",
+                            "SELECT COUNT(*) FROM $table WHERE video_id = %d",
+                            $video_id
+                        ));
+                        
+                        // Get coins claimed count for this video
+                        $coins_claimed_count = $wpdb->get_var($wpdb->prepare(
+                            "SELECT COUNT(*) 
+                             FROM $coins_table ucc
+                             INNER JOIN $table vc ON ucc.click_id = vc.id
+                             WHERE vc.video_id = %d 
+                             AND ucc.transaction_type = 'claim'",
                             $video_id
                         ));
                     ?>
@@ -441,6 +538,7 @@ function bvt_all_videos_page() {
                             <td><a href="<?php echo esc_url($video_url); ?>" target="_blank"><?php echo esc_html($video_url); ?></a></td>
                             <td><?php echo get_the_date(); ?></td>
                             <td><?php echo intval($click_count); ?></td>
+                            <td><strong style="color: #ff6b00;"><?php echo intval($coins_claimed_count); ?></strong></td>
                             <td>
                                 <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=bvt-all-videos&action=delete&video_id=' . $video_id), 'delete_video_' . $video_id); ?>" 
                                    onclick="return confirm('Are you sure you want to delete this video?');" 
@@ -450,7 +548,7 @@ function bvt_all_videos_page() {
                     <?php endwhile; ?>
                 <?php else : ?>
                     <tr>
-                        <td colspan="5">No videos found.</td>
+                        <td colspan="6">No videos found.</td>
                     </tr>
                 <?php endif; ?>
             </tbody>
@@ -540,6 +638,196 @@ function bvt_tracking_stats_page() {
                 <?php endif; ?>
             </tbody>
         </table>
+    </div>
+    <?php
+}
+
+/* =========================================
+ * SHORTCODES ADMIN PAGE
+ * ========================================= */
+function bvt_shortcodes_page() {
+    ?>
+    <div class="wrap">
+        <h1>Available Shortcodes</h1>
+        <p>Use these shortcodes in your posts, pages, or widgets to display video functionality.</p>
+        
+        <div style="margin-top: 30px;">
+            
+            <!-- Shortcode 1: video_links -->
+            <div class="card" style="max-width: 1000px; margin-bottom: 30px; padding: 20px;">
+                <h2 style="margin-top: 0; color: #2271b1;">[video_links]</h2>
+                <p><strong>Description:</strong> Displays all video links with thumbnails and play buttons. Users can click to watch videos and earn coins.</p>
+                
+                <h3>Features:</h3>
+                <ul>
+                    <li>Shows all published videos (admin and user-uploaded)</li>
+                    <li>User-uploaded videos appear first, then admin videos</li>
+                    <li>Automatic YouTube thumbnail extraction</li>
+                    <li>Play button overlay on thumbnails</li>
+                    <li>Tracks clicks and redirects for coin rewards</li>
+                    <li>Hides videos that user claimed coins from (12-hour cooldown)</li>
+                    <li>Shows "Claim Coins" button for eligible users (24-hour window)</li>
+                    <li>Displays user's coin balance</li>
+                </ul>
+                
+                <h3>Usage:</h3>
+                <div style="background: #f0f0f0; padding: 15px; border-radius: 3px; margin: 10px 0;">
+                    <code style="font-size: 16px; color: #d63384;">[video_links]</code>
+                </div>
+                
+                <h3>Example:</h3>
+                <div style="background: #f0f0f0; padding: 15px; border-radius: 3px; margin: 10px 0;">
+                    <p>Add this shortcode to any page or post:</p>
+                    <pre style="background: #fff; padding: 10px; border: 1px solid #ddd; border-radius: 3px;">[video_links]</pre>
+                </div>
+                
+                <h3>Where to Use:</h3>
+                <ul>
+                    <li>In page/post content: <code>[video_links]</code></li>
+                    <li>In widgets: Add shortcode widget and paste <code>[video_links]</code></li>
+                    <li>In theme templates: <code>&lt;?php echo do_shortcode('[video_links]'); ?&gt;</code></li>
+                </ul>
+                
+                <h3>User Experience:</h3>
+                <ul>
+                    <li><strong>Logged-in users:</strong> Can see videos, click to watch, and claim coins</li>
+                    <li><strong>Guests:</strong> Can see videos and click to watch (no coin tracking)</li>
+                    <li><strong>Coin display:</strong> Shows total coins and claim button if eligible</li>
+                </ul>
+            </div>
+            
+            <!-- Shortcode 2: upload_video -->
+            <div class="card" style="max-width: 1000px; margin-bottom: 30px; padding: 20px;">
+                <h2 style="margin-top: 0; color: #2271b1;">[upload_video]</h2>
+                <p><strong>Description:</strong> Allows logged-in users to upload video URLs. Requires 10 coins per upload.</p>
+                
+                <h3>Features:</h3>
+                <ul>
+                    <li>Upload form for video URLs (YouTube, Facebook, Instagram)</li>
+                    <li>Coin balance display</li>
+                    <li>Automatic coin deduction (10 coins per video)</li>
+                    <li>URL validation</li>
+                    <li>Success/error messages</li>
+                    <li>Only visible to logged-in users with 10+ coins</li>
+                </ul>
+                
+                <h3>Requirements:</h3>
+                <ul>
+                    <li>User must be logged in</li>
+                    <li>User must have at least <strong>10 coins</strong></li>
+                    <li>Valid video URL (YouTube, Facebook, or Instagram)</li>
+                </ul>
+                
+                <h3>Usage:</h3>
+                <div style="background: #f0f0f0; padding: 15px; border-radius: 3px; margin: 10px 0;">
+                    <code style="font-size: 16px; color: #d63384;">[upload_video]</code>
+                </div>
+                
+                <h3>Example:</h3>
+                <div style="background: #f0f0f0; padding: 15px; border-radius: 3px; margin: 10px 0;">
+                    <p>Add this shortcode to any page or post:</p>
+                    <pre style="background: #fff; padding: 10px; border: 1px solid #ddd; border-radius: 3px;">[upload_video]</pre>
+                </div>
+                
+                <h3>Where to Use:</h3>
+                <ul>
+                    <li>In page/post content: <code>[upload_video]</code></li>
+                    <li>In widgets: Add shortcode widget and paste <code>[upload_video]</code></li>
+                    <li>In theme templates: <code>&lt;?php echo do_shortcode('[upload_video]'); ?&gt;</code></li>
+                </ul>
+                
+                <h3>User Experience:</h3>
+                <ul>
+                    <li><strong>Not logged in:</strong> Shows login prompt</li>
+                    <li><strong>Logged in with &lt; 10 coins:</strong> Shows message "You need at least 10 coins"</li>
+                    <li><strong>Logged in with 10+ coins:</strong> Shows upload form</li>
+                    <li><strong>After upload:</strong> 10 coins deducted, success message shown</li>
+                </ul>
+                
+                <h3>Coin System:</h3>
+                <ul>
+                    <li>Cost: <strong>10 coins</strong> per video upload</li>
+                    <li>Coins are deducted immediately upon successful upload</li>
+                    <li>If deduction fails, video is not created (transaction rollback)</li>
+                </ul>
+            </div>
+            
+            <!-- Combined Usage Example -->
+            <div class="card" style="max-width: 1000px; margin-bottom: 30px; padding: 20px; background: #e7f3ff; border: 2px solid #2271b1;">
+                <h2 style="margin-top: 0; color: #2271b1;">📋 Complete Setup Example</h2>
+                <p><strong>Recommended page structure:</strong></p>
+                
+                <h3>Page 1: Video Gallery</h3>
+                <div style="background: #fff; padding: 15px; border-radius: 3px; margin: 10px 0;">
+                    <p><strong>Title:</strong> Watch Videos & Earn Coins</p>
+                    <p><strong>Content:</strong></p>
+                    <pre style="background: #f0f0f0; padding: 10px; border: 1px solid #ddd; border-radius: 3px;">[video_links]</pre>
+                    <p>This page shows all videos. Users can watch and claim coins.</p>
+                </div>
+                
+                <h3>Page 2: Upload Video</h3>
+                <div style="background: #fff; padding: 15px; border-radius: 3px; margin: 10px 0;">
+                    <p><strong>Title:</strong> Upload Your Video</p>
+                    <p><strong>Content:</strong></p>
+                    <pre style="background: #f0f0f0; padding: 10px; border: 1px solid #ddd; border-radius: 3px;">[upload_video]</pre>
+                    <p>This page allows users to upload videos (requires 10 coins).</p>
+                </div>
+                
+                <h3>Combined Page (All-in-One)</h3>
+                <div style="background: #fff; padding: 15px; border-radius: 3px; margin: 10px 0;">
+                    <p><strong>Title:</strong> Video Center</p>
+                    <p><strong>Content:</strong></p>
+                    <pre style="background: #f0f0f0; padding: 10px; border: 1px solid #ddd; border-radius: 3px;">&lt;h2&gt;Upload Video&lt;/h2&gt;
+[upload_video]
+
+&lt;h2&gt;Watch Videos &amp; Earn Coins&lt;/h2&gt;
+[video_links]</pre>
+                    <p>This combines both shortcodes on one page.</p>
+                </div>
+            </div>
+            
+            <!-- Quick Reference -->
+            <div class="card" style="max-width: 1000px; margin-bottom: 30px; padding: 20px; background: #fff3cd; border: 2px solid #ffc107;">
+                <h2 style="margin-top: 0; color: #856404;">⚡ Quick Reference</h2>
+                <table class="widefat" style="margin-top: 15px;">
+                    <thead>
+                        <tr>
+                            <th>Shortcode</th>
+                            <th>Purpose</th>
+                            <th>Requirements</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>[video_links]</code></td>
+                            <td>Display all videos with thumbnails</td>
+                            <td>None (works for all users)</td>
+                        </tr>
+                        <tr>
+                            <td><code>[upload_video]</code></td>
+                            <td>Allow users to upload videos</td>
+                            <td>Logged in + 10 coins</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            
+            <!-- Tips -->
+            <div class="card" style="max-width: 1000px; margin-bottom: 30px; padding: 20px;">
+                <h2 style="margin-top: 0; color: #2271b1;">💡 Tips & Best Practices</h2>
+                <ul>
+                    <li><strong>Video Display Order:</strong> User-uploaded videos appear first, then admin videos</li>
+                    <li><strong>Hidden Videos:</strong> Videos hidden by admin won't appear in <code>[video_links]</code></li>
+                    <li><strong>Coin System:</strong> Users earn 1 coin per video watched (if they return after 2+ minutes)</li>
+                    <li><strong>Upload Cost:</strong> Each video upload costs 10 coins</li>
+                    <li><strong>Cooldown:</strong> Videos are hidden for 12 hours after user claims coins</li>
+                    <li><strong>Claim Window:</strong> Users have 24 hours to claim coins after watching</li>
+                    <li><strong>Multiple Shortcodes:</strong> You can use both shortcodes on the same page</li>
+                    <li><strong>Widget Support:</strong> Both shortcodes work in WordPress widgets</li>
+                </ul>
+            </div>
+            
+        </div>
     </div>
     <?php
 }
@@ -684,7 +972,7 @@ add_shortcode('video_links', function () {
             $user_videos_query->the_post();
             $video_id = get_the_ID();
             $url = get_post_meta($video_id, '_video_url', true);
-            $thumbnail = bvt_get_video_thumbnail($url);
+            $thumbnail = bvt_get_video_thumbnail($url, $video_id);
             
             echo '<div class="video-item" style="display:inline-block; margin:10px; text-align:center;">
                     <div class="video-card" data-url="'.esc_url($url).'" data-id="'.$video_id.'" style="position:relative; cursor:pointer; display:inline-block;">
@@ -702,7 +990,7 @@ add_shortcode('video_links', function () {
             $admin_videos_query->the_post();
             $video_id = get_the_ID();
             $url = get_post_meta($video_id, '_video_url', true);
-            $thumbnail = bvt_get_video_thumbnail($url);
+            $thumbnail = bvt_get_video_thumbnail($url, $video_id);
             
             echo '<div class="video-item" style="display:inline-block; margin:10px; text-align:center;">
                     <div class="video-card" data-url="'.esc_url($url).'" data-id="'.$video_id.'" style="position:relative; cursor:pointer; display:inline-block;">
@@ -770,10 +1058,51 @@ add_shortcode('video_links', function () {
     }
 
     // Add JS to handle click & tracking
+    $is_logged_in = is_user_logged_in();
+    $login_url = wp_login_url(get_permalink());
     ?>
     <script>
+    const isUserLoggedIn = <?php echo $is_logged_in ? 'true' : 'false'; ?>;
+    const loginUrl = '<?php echo esc_js($login_url); ?>';
+    
+    // Function to show login popup
+    function showLoginPopup() {
+        // Create popup overlay
+        const overlay = document.createElement('div');
+        overlay.id = 'bvt-login-popup-overlay';
+        overlay.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 999999; display: flex; align-items: center; justify-content: center;';
+        
+        // Create popup box
+        const popup = document.createElement('div');
+        popup.style.cssText = 'background: white; padding: 30px; border-radius: 10px; max-width: 400px; text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.3);';
+        popup.innerHTML = `
+            <h2 style="margin-top: 0; color: #333;">Please Login</h2>
+            <p style="color: #666; margin-bottom: 20px;">You need to be logged in to watch videos.</p>
+            <div style="display: flex; gap: 10px; justify-content: center;">
+                <a href="${loginUrl}" class="button button-primary" style="padding: 10px 20px; text-decoration: none; display: inline-block;">Login</a>
+                <button onclick="document.getElementById('bvt-login-popup-overlay').remove();" class="button" style="padding: 10px 20px; cursor: pointer;">Cancel</button>
+            </div>
+        `;
+        
+        overlay.appendChild(popup);
+        document.body.appendChild(overlay);
+        
+        // Close on overlay click (outside popup)
+        overlay.addEventListener('click', function(e) {
+            if (e.target === overlay) {
+                overlay.remove();
+            }
+        });
+    }
+    
     document.querySelectorAll('.video-card').forEach(function(card){
         card.addEventListener('click', function(){
+            // Check if user is logged in
+            if (!isUserLoggedIn) {
+                showLoginPopup();
+                return;
+            }
+            
             const videoId = card.dataset.id;
             const videoUrl = card.dataset.url;
 
