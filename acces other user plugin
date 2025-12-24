@@ -1,0 +1,185 @@
+<?php
+/**
+ * Restrict Bulk Video Tracker Plugin Admin Access
+ * Admins have full access. User ID 2 can also access the plugin.
+ * 
+ * Add this code to your theme's functions.php file
+ */
+
+// Define allowed user ID (change this to your desired user ID)
+$bvt_allowed_user_id = 2;
+
+// Helper function to check if user has access to plugin (without triggering capability filters)
+function bvt_user_has_plugin_access($user_id = null) {
+    global $bvt_allowed_user_id;
+    static $checked_users = array(); // Cache to prevent recursion
+    
+    if ($user_id === null) {
+        $user_id = get_current_user_id();
+    }
+    
+    if (!$user_id) {
+        return false;
+    }
+    
+    // Check cache to prevent infinite loops
+    if (isset($checked_users[$user_id])) {
+        return $checked_users[$user_id];
+    }
+    
+    $user = get_userdata($user_id);
+    if (!$user) {
+        $checked_users[$user_id] = false;
+        return false;
+    }
+    
+    // Admins have full access - check role directly without user_can() to avoid recursion
+    if (in_array('administrator', (array) $user->roles)) {
+        $checked_users[$user_id] = true;
+        return true;
+    }
+    
+    // Check if user is the allowed user ID
+    if ($user_id == $bvt_allowed_user_id) {
+        $checked_users[$user_id] = true;
+        return true;
+    }
+    
+    $checked_users[$user_id] = false;
+    return false;
+}
+
+// Grant manage_options capability to allowed user for plugin access
+add_filter('user_has_cap', 'bvt_grant_plugin_capabilities', 10, 4);
+
+function bvt_grant_plugin_capabilities($allcaps, $caps, $args, $user) {
+    global $bvt_allowed_user_id;
+    
+    // Admins already have manage_options, so skip
+    if (isset($user->roles) && in_array('administrator', (array) $user->roles)) {
+        return $allcaps;
+    }
+    
+    // Only grant capabilities if user is the allowed user
+    if (isset($user->ID) && $user->ID == $bvt_allowed_user_id) {
+        // Check if we're on a plugin admin page
+        $current_page = isset($_GET['page']) ? sanitize_text_field($_GET['page']) : '';
+        $plugin_pages = [
+            'bulk-video-upload',
+            'bvt-video-management',
+            'bvt-all-videos',
+            'bvt-tracking-stats',
+            'bvt-shortcodes'
+        ];
+        
+        // If on plugin page or checking for manage_options, grant it
+        if (in_array($current_page, $plugin_pages) || 
+            (isset($args[0]) && $args[0] === 'manage_options') ||
+            (isset($caps[0]) && $caps[0] === 'manage_options')) {
+            $allcaps['manage_options'] = true;
+        }
+    }
+    
+    return $allcaps;
+}
+
+// Remove admin menu items for unauthorized users
+add_action('admin_menu', 'bvt_restrict_admin_menu', 999);
+
+function bvt_restrict_admin_menu() {
+    // Check if current user has access (admin or allowed user ID)
+    if (!bvt_user_has_plugin_access()) {
+        // Remove all plugin menu items
+        remove_menu_page('bulk-video-upload');
+        remove_submenu_page('bulk-video-upload', 'bulk-video-upload');
+        remove_submenu_page('bulk-video-upload', 'bvt-video-management');
+        remove_submenu_page('bulk-video-upload', 'bvt-all-videos');
+        remove_submenu_page('bulk-video-upload', 'bvt-tracking-stats');
+        remove_submenu_page('bulk-video-upload', 'bvt-shortcodes');
+    }
+}
+
+// Prevent direct access to admin pages via URL
+add_action('admin_init', 'bvt_restrict_admin_pages');
+
+function bvt_restrict_admin_pages() {
+    // List of plugin admin page slugs
+    $restricted_pages = [
+        'bulk-video-upload',
+        'bvt-video-management',
+        'bvt-all-videos',
+        'bvt-tracking-stats',
+        'bvt-shortcodes'
+    ];
+    
+    // Get current page
+    $current_page = isset($_GET['page']) ? sanitize_text_field($_GET['page']) : '';
+    
+    // Check if user is trying to access a restricted page and doesn't have access
+    if (in_array($current_page, $restricted_pages) && !bvt_user_has_plugin_access()) {
+        wp_die(
+            '<h1>Access Denied</h1>
+            <p>You do not have permission to access this page.</p>
+            <p><a href="' . admin_url() . '">← Go to Dashboard</a></p>',
+            'Access Denied',
+            ['response' => 403]
+        );
+    }
+}
+
+// Restrict admin bulk upload action (but allow frontend uploads)
+add_action('admin_init', 'bvt_restrict_admin_bulk_upload');
+
+function bvt_restrict_admin_bulk_upload() {
+    // Only restrict if user is trying to bulk upload from admin panel and doesn't have access
+    if (isset($_POST['bvt_submit']) && !bvt_user_has_plugin_access()) {
+        wp_die(
+            '<h1>Access Denied</h1>
+            <p>You do not have permission to bulk upload videos from admin panel.</p>
+            <p><a href="' . admin_url() . '">← Go to Dashboard</a></p>',
+            'Access Denied',
+            ['response' => 403]
+        );
+    }
+}
+
+// Also grant capabilities for AJAX actions
+add_filter('map_meta_cap', 'bvt_map_meta_cap_for_plugin', 10, 4);
+
+function bvt_map_meta_cap_for_plugin($caps, $cap, $user_id, $args) {
+    global $bvt_allowed_user_id;
+    
+    if (!$user_id) {
+        return $caps;
+    }
+    
+    $user = get_userdata($user_id);
+    if (!$user) {
+        return $caps;
+    }
+    
+    // Admins already have all capabilities, so skip (check role directly to avoid recursion)
+    if (in_array('administrator', (array) $user->roles)) {
+        return $caps;
+    }
+    
+    // If user is the allowed user and checking manage_options, allow it
+    if ($user_id == $bvt_allowed_user_id && $cap === 'manage_options') {
+        // Check if this is related to plugin functionality
+        $current_page = isset($_GET['page']) ? sanitize_text_field($_GET['page']) : '';
+        $plugin_pages = [
+            'bulk-video-upload',
+            'bvt-video-management',
+            'bvt-all-videos',
+            'bvt-tracking-stats',
+            'bvt-shortcodes'
+        ];
+        
+        if (in_array($current_page, $plugin_pages) || 
+            (isset($_POST['bvt_submit']) || (isset($_POST['action']) && strpos($_POST['action'], 'bvt_') === 0))) {
+            return ['exist']; // User exists, so they can do it
+        }
+    }
+    
+    return $caps;
+}
